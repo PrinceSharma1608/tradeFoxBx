@@ -8,7 +8,10 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
+import java.util.HexFormat;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -16,6 +19,9 @@ import java.util.Map;
 
 @Service
 public class PortfolioTradingService {
+    private static final BigDecimal MAX_WALLET_BALANCE = new BigDecimal("9999999999999.99");
+    private static final BigDecimal MAX_ORDER_AMOUNT = new BigDecimal("9999999999.99");
+
     private final JdbcTemplate db;
     private final IndstocksMarketDataService marketDataService;
 
@@ -25,6 +31,7 @@ public class PortfolioTradingService {
     }
 
     private static final Map<String, String> CANONICAL_STOCK_NAMES = Map.ofEntries(
+            // Nifty 50 & Large Caps
             Map.entry("RELIANCE", "Reliance Industries Ltd."),
             Map.entry("TCS", "Tata Consultancy Services Ltd."),
             Map.entry("HDFCBANK", "HDFC Bank Ltd."),
@@ -44,21 +51,93 @@ public class PortfolioTradingService {
             Map.entry("TATASTEEL", "Tata Steel Ltd."),
             Map.entry("HCLTECH", "HCL Technologies Ltd."),
             Map.entry("HINDUNILVR", "Hindustan Unilever Ltd."),
-            Map.entry("SUNPHARMA", "Sun Pharmaceutical Industries"),
+            Map.entry("SUNPHARMA", "Sun Pharmaceutical Industries Ltd."),
             Map.entry("NTPC", "NTPC Ltd."),
-            Map.entry("POWERGRID", "Power Grid Corporation"),
-            Map.entry("ONGC", "Oil & Natural Gas Corporation"),
+            Map.entry("POWERGRID", "Power Grid Corporation of India"),
+            Map.entry("ONGC", "Oil & Natural Gas Corporation Ltd."),
             Map.entry("M&M", "Mahindra & Mahindra Ltd."),
             Map.entry("HAL", "Hindustan Aeronautics Ltd."),
             Map.entry("BEL", "Bharat Electronics Ltd."),
             Map.entry("ZOMATO", "Zomato Ltd."),
             Map.entry("JIOFIN", "Jio Financial Services Ltd."),
             Map.entry("ADANIENT", "Adani Enterprises Ltd."),
-            Map.entry("ADANIPORTS", "Adani Ports & SEZ Ltd."),
+            Map.entry("ADANIPORTS", "Adani Ports and SEZ Ltd."),
             Map.entry("COALINDIA", "Coal India Ltd."),
-            Map.entry("DRREDDY", "Dr. Reddy's Laboratories"),
+            Map.entry("DRREDDY", "Dr. Reddy's Laboratories Ltd."),
             Map.entry("CIPLA", "Cipla Ltd."),
-            Map.entry("IRCTC", "Indian Railway Catering & Tourism")
+            Map.entry("IRCTC", "Indian Railway Catering & Tourism Corp"),
+            // High-Demand Power, Railways & PSU Giants
+            Map.entry("TATAPOWER", "Tata Power Company Ltd."),
+            Map.entry("SUZLON", "Suzlon Energy Ltd."),
+            Map.entry("IREDA", "Indian Renewable Energy Dev Agency"),
+            Map.entry("RVNL", "Rail Vikas Nigam Ltd."),
+            Map.entry("IRFC", "Indian Railway Finance Corporation"),
+            Map.entry("BHEL", "Bharat Heavy Electricals Ltd."),
+            Map.entry("NHPC", "NHPC Ltd."),
+            Map.entry("SJVN", "SJVN Ltd."),
+            Map.entry("ADANIGREEN", "Adani Green Energy Ltd."),
+            Map.entry("ADANIPOWER", "Adani Power Ltd."),
+            // Retail, FMCG & Aviation
+            Map.entry("TRENT", "Trent Ltd."),
+            Map.entry("DMART", "Avenue Supermarts Ltd."),
+            Map.entry("ASIANPAINT", "Asian Paints Ltd."),
+            Map.entry("NESTLEIND", "Nestle India Ltd."),
+            Map.entry("BRITANNIA", "Britannia Industries Ltd."),
+            Map.entry("PIDILITIND", "Pidilite Industries Ltd."),
+            Map.entry("BERGEPAINT", "Berger Paints India Ltd."),
+            Map.entry("INDIGO", "InterGlobe Aviation Ltd."),
+            Map.entry("DLF", "DLF Ltd."),
+            // Defense & Shipbuilders
+            Map.entry("MAZDOCK", "Mazagon Dock Shipbuilders Ltd."),
+            Map.entry("COCHINSHIP", "Cochin Shipyard Ltd."),
+            Map.entry("BDL", "Bharat Dynamics Ltd."),
+            // Banking, NBFC & Insurance
+            Map.entry("PNB", "Punjab National Bank"),
+            Map.entry("BANKBARODA", "Bank of Baroda"),
+            Map.entry("CANBK", "Canara Bank"),
+            Map.entry("IDFCFIRSTB", "IDFC First Bank Ltd."),
+            Map.entry("FEDERALBNK", "The Federal Bank Ltd."),
+            Map.entry("MUTHOOTFIN", "Muthoot Finance Ltd."),
+            Map.entry("CHOLAFIN", "Cholamandalam Investment & Finance"),
+            Map.entry("SHRIRAMFIN", "Shriram Finance Ltd."),
+            Map.entry("LICI", "Life Insurance Corporation of India"),
+            Map.entry("SBILIFE", "SBI Life Insurance Company Ltd."),
+            Map.entry("HDFCLIFE", "HDFC Life Insurance Company Ltd."),
+            // Fintech & Depository
+            Map.entry("PAYTM", "One97 Communications Ltd. (Paytm)"),
+            Map.entry("CDSL", "Central Depository Services Ltd."),
+            Map.entry("ANGELONE", "Angel One Ltd."),
+            // Auto & Mobility
+            Map.entry("EICHERMOT", "Eicher Motors Ltd."),
+            Map.entry("HEROMOTOCO", "Hero MotoCorp Ltd."),
+            Map.entry("BAJAJ-AUTO", "Bajaj Auto Ltd."),
+            Map.entry("TVSMOTOR", "TVS Motor Company Ltd."),
+            Map.entry("MOTHERSON", "Samvardhana Motherson International"),
+            // IT Services
+            Map.entry("TECHM", "Tech Mahindra Ltd."),
+            Map.entry("LTIM", "LTIMindtree Ltd."),
+            Map.entry("PERSISTENT", "Persistent Systems Ltd."),
+            Map.entry("COFORGE", "Coforge Ltd."),
+            // Metals, Mining, Oil & Gas
+            Map.entry("VEDL", "Vedanta Ltd."),
+            Map.entry("JSWSTEEL", "JSW Steel Ltd."),
+            Map.entry("HINDALCO", "Hindalco Industries Ltd."),
+            Map.entry("JINDALSTEL", "Jindal Steel & Power Ltd."),
+            Map.entry("NMDC", "NMDC Ltd."),
+            Map.entry("BPCL", "Bharat Petroleum Corporation Ltd."),
+            Map.entry("IOC", "Indian Oil Corporation Ltd."),
+            Map.entry("GAIL", "GAIL (India) Ltd."),
+            // Cement & Telecom
+            Map.entry("ULTRACEMCO", "UltraTech Cement Ltd."),
+            Map.entry("AMBUJACEM", "Ambuja Cements Ltd."),
+            Map.entry("GRASIM", "Grasim Industries Ltd."),
+            Map.entry("IDEA", "Vodafone Idea Ltd."),
+            // Healthcare & Pharma
+            Map.entry("APOLLOHOSP", "Apollo Hospitals Enterprise Ltd."),
+            Map.entry("MAXHEALTH", "Max Healthcare Institute Ltd."),
+            Map.entry("MANKIND", "Mankind Pharma Ltd."),
+            Map.entry("LUPIN", "Lupin Ltd."),
+            Map.entry("AUROPHARMA", "Aurobindo Pharma Ltd.")
     );
 
     public static String resolveStockName(String symbol, String providedName) {
@@ -82,11 +161,19 @@ public class PortfolioTradingService {
     public OrderResult executeOrder(long userId, String rawSymbol, String rawName,
                                     String rawOrderType, BigDecimal price, int quantity,
                                     String rawExecutionType, BigDecimal currentMarketPrice) {
+        return executeOrder(userId, rawSymbol, rawName, rawOrderType, price, quantity,
+                rawExecutionType, currentMarketPrice, null);
+    }
+
+    @Transactional
+    public OrderResult executeOrder(long userId, String rawSymbol, String rawName,
+                                    String rawOrderType, BigDecimal requestedPrice, int quantity,
+                                    String rawExecutionType, BigDecimal ignoredClientMarketPrice,
+                                    String rawIdempotencyKey) {
         if (userId <= 0) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Valid user ID is required");
         }
         String symbol = rawSymbol == null ? "" : rawSymbol.trim().toUpperCase(Locale.ROOT);
-        String name = resolveStockName(symbol, rawName);
         String orderType = rawOrderType == null ? "" : rawOrderType.trim().toUpperCase(Locale.ROOT);
         String executionType = (rawExecutionType == null || rawExecutionType.isBlank())
                 ? "MARKET" : rawExecutionType.trim().toUpperCase(Locale.ROOT);
@@ -97,27 +184,116 @@ public class PortfolioTradingService {
         if (!"BUY".equals(orderType) && !"SELL".equals(orderType)) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Order type must be either BUY or SELL");
         }
-        if (price == null || price.compareTo(BigDecimal.ZERO) <= 0) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Order price must be positive");
+        if (!"MARKET".equals(executionType) && !"LIMIT".equals(executionType)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Execution type must be MARKET or LIMIT");
         }
         if (quantity <= 0) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Quantity must be greater than zero");
         }
 
-        // Fetch user wallet balance
-        List<BigDecimal> balances = db.query(
-                "SELECT wallet_balance FROM users WHERE user_id = ? AND is_active = TRUE",
-                (rs, rowNum) -> rs.getBigDecimal("wallet_balance"),
-                userId
-        );
-        if (balances.isEmpty()) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Active user not found");
+        BigDecimal limitPrice = requestedPrice;
+        if ("LIMIT".equals(executionType)
+                && (limitPrice == null || limitPrice.compareTo(BigDecimal.ZERO) <= 0)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Limit price must be positive");
         }
-        BigDecimal currentBalance = balances.getFirst();
-        BigDecimal totalAmount = price.multiply(BigDecimal.valueOf(quantity)).setScale(2, RoundingMode.HALF_UP);
+        if (limitPrice != null && limitPrice.scale() > 2 && "LIMIT".equals(executionType)) {
+            limitPrice = limitPrice.setScale(2, RoundingMode.HALF_UP);
+        }
 
-        BigDecimal effectiveMarketPrice = (currentMarketPrice != null && currentMarketPrice.compareTo(BigDecimal.ZERO) > 0)
-                ? currentMarketPrice : price;
+        String idempotencyKey = rawIdempotencyKey == null ? null : rawIdempotencyKey.trim();
+        if (idempotencyKey != null && (idempotencyKey.isBlank() || idempotencyKey.length() > 100)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Idempotency-Key must contain between 1 and 100 characters");
+        }
+        String requestHash = hashOrderRequest(symbol, orderType, executionType,
+                "LIMIT".equals(executionType) ? limitPrice : null, quantity);
+
+        // A retry of a committed order can be replayed even when market data is temporarily unavailable.
+        if (idempotencyKey != null) {
+            List<StoredOrder> existing = findOrderByIdempotencyKey(userId, idempotencyKey);
+            if (!existing.isEmpty()) {
+                StoredOrder order = existing.getFirst();
+                if (!requestHash.equals(order.requestHash())) {
+                    throw new ResponseStatusException(HttpStatus.CONFLICT,
+                            "Idempotency-Key was already used for a different order");
+                }
+                List<BigDecimal> balance = db.query(
+                        "SELECT wallet_balance FROM users WHERE user_id = ? AND is_active = TRUE",
+                        (rs, rowNum) -> rs.getBigDecimal("wallet_balance"), userId);
+                if (balance.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Active user not found");
+                return replay(order, balance.getFirst());
+            }
+        }
+
+        IndstocksMarketDataService.StockQuote quote;
+        try {
+            quote = marketDataService.getStockQuote(symbol);
+        } catch (ResponseStatusException exception) {
+            if (exception.getStatusCode() == HttpStatus.NOT_FOUND) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unsupported stock symbol");
+            }
+            throw exception;
+        }
+        if (quote.price() == null || quote.price().compareTo(BigDecimal.ZERO) <= 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "Market provider returned an invalid stock price");
+        }
+        String name = quote.stockName();
+        BigDecimal price = "LIMIT".equals(executionType)
+                ? limitPrice : quote.price().setScale(2, RoundingMode.HALF_UP);
+        BigDecimal effectiveMarketPrice = quote.price();
+        BigDecimal totalAmount = price.multiply(BigDecimal.valueOf(quantity)).setScale(2, RoundingMode.HALF_UP);
+        if (price.compareTo(MAX_ORDER_AMOUNT) > 0 || totalAmount.compareTo(MAX_ORDER_AMOUNT) > 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Order amount exceeds the supported limit");
+        }
+
+        // This lock serializes wallet and holding changes for this user, including simultaneous orders.
+        List<BigDecimal> balances = db.query("""
+                        SELECT wallet_balance FROM users
+                        WHERE user_id = ? AND is_active = TRUE
+                        FOR UPDATE
+                        """,
+                (rs, rowNum) -> rs.getBigDecimal("wallet_balance"), userId);
+        if (balances.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Active user not found");
+        BigDecimal currentBalance = balances.getFirst();
+
+        if (idempotencyKey != null) {
+            List<StoredOrder> existing = db.query("""
+                            SELECT order_id, user_id, stock_symbol, stock_name, order_type,
+                                   order_price, quantity, order_status, request_hash
+                            FROM orders WHERE user_id = ? AND idempotency_key = ?
+                            FOR UPDATE
+                            """,
+                    (rs, rowNum) -> new StoredOrder(rs.getLong("order_id"), rs.getLong("user_id"),
+                            rs.getString("stock_symbol"), rs.getString("stock_name"), rs.getString("order_type"),
+                            rs.getBigDecimal("order_price"), rs.getInt("quantity"), rs.getString("order_status"),
+                            rs.getString("request_hash")), userId, idempotencyKey);
+            if (!existing.isEmpty()) {
+                StoredOrder order = existing.getFirst();
+                if (!requestHash.equals(order.requestHash())) {
+                    throw new ResponseStatusException(HttpStatus.CONFLICT,
+                            "Idempotency-Key was already used for a different order");
+                }
+                return replay(order, currentBalance);
+            }
+        } else {
+            // Also absorb an immediate retry from clients that have not added an idempotency header yet.
+            List<StoredOrder> recent = db.query("""
+                            SELECT order_id, user_id, stock_symbol, stock_name, order_type,
+                                   order_price, quantity, order_status, request_hash
+                            FROM orders
+                            WHERE user_id = ? AND idempotency_key IS NULL
+                              AND request_hash = ?
+                              AND order_status IN ('EXECUTED', 'PENDING')
+                              AND created_at >= CURRENT_TIMESTAMP - INTERVAL '5 seconds'
+                            ORDER BY created_at DESC LIMIT 1
+                            FOR UPDATE
+                            """,
+                    (rs, rowNum) -> new StoredOrder(rs.getLong("order_id"), rs.getLong("user_id"),
+                            rs.getString("stock_symbol"), rs.getString("stock_name"), rs.getString("order_type"),
+                            rs.getBigDecimal("order_price"), rs.getInt("quantity"), rs.getString("order_status"),
+                            rs.getString("request_hash")), userId, requestHash);
+            if (!recent.isEmpty()) return replay(recent.getFirst(), currentBalance);
+        }
 
         // Check if LIMIT condition is satisfied immediately or should remain PENDING
         boolean isLimitOrder = "LIMIT".equals(executionType);
@@ -166,6 +342,9 @@ public class PortfolioTradingService {
             if (!shouldRemainPending) {
                 // Execute immediately: credit wallet balance & deduct holding
                 newBalance = currentBalance.add(totalAmount).setScale(2, RoundingMode.HALF_UP);
+                if (newBalance.compareTo(MAX_WALLET_BALANCE) > 0) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Wallet balance exceeds the supported limit");
+                }
                 db.update("UPDATE users SET wallet_balance = ? WHERE user_id = ?", newBalance, userId);
                 updateHoldingOnSell(userId, symbol, quantity, existingHoldings.getFirst());
             }
@@ -175,12 +354,14 @@ public class PortfolioTradingService {
 
         // Insert Order Record
         Long orderId = db.queryForObject("""
-                INSERT INTO orders (user_id, stock_symbol, stock_name, order_type, order_price, quantity, order_status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO orders (user_id, stock_symbol, stock_name, order_type, order_price, quantity,
+                                    order_status, idempotency_key, request_hash, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 RETURNING order_id
                 """,
                 Long.class,
-                userId, symbol, name, orderType, price.setScale(2, RoundingMode.HALF_UP), quantity, finalStatus
+                userId, symbol, name, orderType, price.setScale(2, RoundingMode.HALF_UP), quantity,
+                finalStatus, idempotencyKey, requestHash
         );
 
         if (!shouldRemainPending) {
@@ -212,6 +393,42 @@ public class PortfolioTradingService {
         );
     }
 
+    private OrderResult replay(StoredOrder order, BigDecimal currentBalance) {
+        BigDecimal total = order.price().multiply(BigDecimal.valueOf(order.quantity()))
+                .setScale(2, RoundingMode.HALF_UP);
+        return new OrderResult(order.orderId(), order.userId(), order.symbol(), order.name(),
+                order.type(), order.price(), order.quantity(), total, currentBalance,
+                order.status(), "Duplicate request; returned the existing order.");
+    }
+
+    private List<StoredOrder> findOrderByIdempotencyKey(long userId, String idempotencyKey) {
+        return db.query("""
+                        SELECT order_id, user_id, stock_symbol, stock_name, order_type,
+                               order_price, quantity, order_status, request_hash
+                        FROM orders WHERE user_id = ? AND idempotency_key = ?
+                        """,
+                (rs, rowNum) -> new StoredOrder(rs.getLong("order_id"), rs.getLong("user_id"),
+                        rs.getString("stock_symbol"), rs.getString("stock_name"), rs.getString("order_type"),
+                        rs.getBigDecimal("order_price"), rs.getInt("quantity"), rs.getString("order_status"),
+                        rs.getString("request_hash")), userId, idempotencyKey);
+    }
+
+    private String hashOrderRequest(String symbol, String type, String executionType,
+                                    BigDecimal limitPrice, int quantity) {
+        String value = symbol + "|" + type + "|" + executionType + "|"
+                + (limitPrice == null ? "" : limitPrice.stripTrailingZeros().toPlainString()) + "|" + quantity;
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception exception) {
+            throw new IllegalStateException("Could not fingerprint the order request", exception);
+        }
+    }
+
+    private record StoredOrder(long orderId, long userId, String symbol, String name,
+                               String type, BigDecimal price, int quantity, String status,
+                               String requestHash) { }
+
     private void updateHoldingOnBuy(long userId, String symbol, String name, int quantity, BigDecimal price, BigDecimal totalAmount) {
         List<HoldingItem> existingHoldings = getHoldingItemsForStock(userId, symbol);
         if (existingHoldings.isEmpty()) {
@@ -222,8 +439,16 @@ public class PortfolioTradingService {
                     userId, symbol, name, quantity, price.setScale(2, RoundingMode.HALF_UP), totalAmount);
         } else {
             HoldingItem current = existingHoldings.getFirst();
-            int updatedQty = current.quantity() + quantity;
+            int updatedQty;
+            try {
+                updatedQty = Math.addExact(current.quantity(), quantity);
+            } catch (ArithmeticException exception) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Holding quantity exceeds the supported limit");
+            }
             BigDecimal updatedInvested = current.investedAmount().add(totalAmount).setScale(2, RoundingMode.HALF_UP);
+            if (updatedInvested.compareTo(MAX_ORDER_AMOUNT) > 0) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invested amount exceeds the supported limit");
+            }
             BigDecimal updatedAvgPrice = updatedInvested.divide(BigDecimal.valueOf(updatedQty), 2, RoundingMode.HALF_UP);
 
             db.update("""
@@ -320,6 +545,17 @@ public class PortfolioTradingService {
     }
 
     private void executePendingOrder(PendingOrder po, BigDecimal executionPrice) {
+        db.query("SELECT user_id FROM users WHERE user_id = ? FOR UPDATE",
+                (rs, rowNum) -> rs.getLong("user_id"), po.userId());
+        List<PendingOrder> stillPending = db.query("""
+                        SELECT order_id, user_id, stock_symbol, stock_name, order_type, order_price, quantity
+                        FROM orders WHERE order_id = ? AND order_status = 'PENDING' FOR UPDATE
+                        """,
+                (rs, rowNum) -> new PendingOrder(rs.getLong("order_id"), rs.getLong("user_id"),
+                        rs.getString("stock_symbol"), rs.getString("stock_name"), rs.getString("order_type"),
+                        rs.getBigDecimal("order_price"), rs.getInt("quantity")), po.orderId());
+        if (stillPending.isEmpty()) return;
+        po = stillPending.getFirst();
         BigDecimal totalAmount = executionPrice.multiply(BigDecimal.valueOf(po.quantity())).setScale(2, RoundingMode.HALF_UP);
         long stockId = Math.abs((long) po.stockSymbol().hashCode());
 
@@ -340,6 +576,11 @@ public class PortfolioTradingService {
                 return;
             }
             db.update("UPDATE users SET wallet_balance = wallet_balance + ? WHERE user_id = ?", totalAmount, po.userId());
+            BigDecimal resultingBalance = db.queryForObject("SELECT wallet_balance FROM users WHERE user_id = ?",
+                    BigDecimal.class, po.userId());
+            if (resultingBalance != null && resultingBalance.compareTo(MAX_WALLET_BALANCE) > 0) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Wallet balance exceeds the supported limit");
+            }
             updateHoldingOnSell(po.userId(), po.stockSymbol(), po.quantity(), existing.getFirst());
         }
 
@@ -481,6 +722,11 @@ public class PortfolioTradingService {
         );
     }
 
+    public List<String> getPendingStockSymbols() {
+        return db.query("SELECT DISTINCT stock_symbol FROM orders WHERE order_status = 'PENDING' ORDER BY stock_symbol",
+                (rs, rowNum) -> rs.getString("stock_symbol"));
+    }
+
     public List<WatchlistDataItem> getWatchlistData(long userId) {
         List<WatchlistItem> watchlist = getWatchlist(userId);
         if (watchlist.isEmpty()) return List.of();
@@ -493,33 +739,26 @@ public class PortfolioTradingService {
         try {
             List<IndstocksMarketDataService.StockQuote> quotes = marketDataService.getStockQuotes(
                     watchlist.stream().map(WatchlistItem::stockSymbol).toList());
-            if (quotes != null) {
-                for (IndstocksMarketDataService.StockQuote quote : quotes) {
-                    if (quote != null && quote.stockSymbol() != null) {
-                        quotesBySymbol.put(quote.stockSymbol().toUpperCase(Locale.ROOT), quote);
-                    }
+            for (IndstocksMarketDataService.StockQuote quote : quotes) {
+                if (quote != null && quote.stockSymbol() != null) {
+                    quotesBySymbol.put(quote.stockSymbol().toUpperCase(Locale.ROOT), quote);
                 }
             }
-        } catch (Exception ex) {
-            // Log and fall back gracefully so user watchlist always loads without 503
+        } catch (Exception exception) {
+            // Keep watchlist access available if the quote provider is temporarily unavailable.
         }
 
         return watchlist.stream().map(item -> {
             IndstocksMarketDataService.StockQuote quote = quotesBySymbol.get(
                     item.stockSymbol().toUpperCase(Locale.ROOT));
             return new WatchlistDataItem(
-                    item.watchlistId(),
-                    item.userId(),
-                    item.stockSymbol(),
-                    item.stockName(),
-                    item.addedAt(),
+                    item.watchlistId(), item.userId(), item.stockSymbol(), item.stockName(), item.addedAt(),
                     quote != null ? quote.price() : null,
                     quote != null ? quote.dayChange() : null,
                     quote != null ? quote.dayChangePercentage() : null,
-                    quote != null ? quote.exchange() : "NSE",
-                    quote != null ? quote.direction() : "UP",
-                    quote != null ? quote.updatedAt() : item.addedAt()
-            );
+                    quote != null ? quote.exchange() : null,
+                    quote != null ? quote.direction() : "UNKNOWN",
+                    quote != null ? quote.updatedAt() : item.addedAt());
         }).toList();
     }
 
@@ -533,6 +772,13 @@ public class PortfolioTradingService {
         if (symbol.isBlank() || symbol.length() > 30) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Stock symbol must be between 1 and 30 characters");
         }
+
+        List<Long> activeUsers = db.query("SELECT user_id FROM users WHERE user_id = ? AND is_active = TRUE",
+                (rs, rowNum) -> rs.getLong("user_id"), userId);
+        if (activeUsers.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Active user not found");
+
+        IndstocksMarketDataService.StockQuote quote = marketDataService.getStockQuote(symbol);
+        name = quote.stockName();
 
         db.update("""
                 INSERT INTO watchlist (user_id, stock_symbol, stock_name, added_at)
