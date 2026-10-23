@@ -6,6 +6,8 @@ import com.tradeFox.service.PortfolioTradingService;
 import com.tradeFox.service.StockDetailService;
 import com.tradeFox.service.UserService;
 import com.tradeFox.service.UserService.UserDetails;
+import com.tradeFox.config.JwtAuthenticationFilter;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -13,6 +15,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -114,14 +117,18 @@ public class ApiController {
     }
 
     @GetMapping("/api/users/{userId}")
-    public UserDetails getUserDetails(@PathVariable long userId) {
+    public UserDetails getUserDetails(@PathVariable long userId, HttpServletRequest httpRequest) {
+        assertOwner(httpRequest, userId);
         return userService.getUserDetails(userId);
     }
 
     // --- Portfolio & Order Handshake Endpoints (Persisted in PostgreSQL) ---
 
     @PostMapping("/api/orders")
-    public PortfolioTradingService.OrderResult executeOrder(@RequestBody OrderRequest request) {
+    public PortfolioTradingService.OrderResult executeOrder(@RequestBody OrderRequest request,
+                                                            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+                                                            HttpServletRequest httpRequest) {
+        assertOwner(httpRequest, request.userId());
         return portfolioTradingService.executeOrder(
                 request.userId(),
                 request.stockSymbol(),
@@ -130,39 +137,65 @@ public class ApiController {
                 request.price(),
                 request.quantity(),
                 request.executionType(),
-                request.marketPrice()
+                request.marketPrice(),
+                idempotencyKey
         );
     }
 
     @PostMapping("/api/orders/{orderId}/cancel")
-    public Map<String, Object> cancelOrder(@PathVariable("orderId") long orderId, @RequestParam("userId") long userId) {
+    public Map<String, Object> cancelOrder(@PathVariable("orderId") long orderId,
+                                           @RequestParam("userId") long userId,
+                                           HttpServletRequest httpRequest) {
+        assertOwner(httpRequest, userId);
         return portfolioTradingService.cancelOrder(userId, orderId);
     }
 
     @GetMapping("/api/orders")
-    public List<PortfolioTradingService.OrderItem> getOrders(@RequestParam("userId") long userId) {
+    public List<PortfolioTradingService.OrderItem> getOrders(@RequestParam("userId") long userId,
+                                                             HttpServletRequest httpRequest) {
+        assertOwner(httpRequest, userId);
         return portfolioTradingService.getOrders(userId);
     }
 
     @GetMapping("/api/holdings")
-    public List<PortfolioTradingService.HoldingItem> getHoldings(@RequestParam("userId") long userId) {
+    public List<PortfolioTradingService.HoldingItem> getHoldings(@RequestParam("userId") long userId,
+                                                                 HttpServletRequest httpRequest) {
+        assertOwner(httpRequest, userId);
         return portfolioTradingService.getHoldings(userId);
     }
 
     @GetMapping("/api/watchlist")
-    public List<PortfolioTradingService.WatchlistDataItem> getWatchlist(@RequestParam("userId") long userId) {
+    public List<PortfolioTradingService.WatchlistDataItem> getWatchlist(@RequestParam("userId") long userId,
+                                                                        HttpServletRequest httpRequest) {
+        assertOwner(httpRequest, userId);
         return portfolioTradingService.getWatchlistData(userId);
     }
 
     @PostMapping("/api/watchlist")
-    public Map<String, Object> addToWatchlist(@RequestBody WatchlistRequest request) {
+    public Map<String, Object> addToWatchlist(@RequestBody WatchlistRequest request,
+                                              HttpServletRequest httpRequest) {
+        assertOwner(httpRequest, request.userId());
         return portfolioTradingService.addToWatchlist(request.userId(), request.stockSymbol(), request.stockName());
     }
 
     @DeleteMapping("/api/watchlist")
     public Map<String, Object> removeFromWatchlist(@RequestParam("userId") long userId,
-                                                   @RequestParam("symbol") String symbol) {
+                                                   @RequestParam("symbol") String symbol,
+                                                   HttpServletRequest httpRequest) {
+        assertOwner(httpRequest, userId);
         return portfolioTradingService.removeFromWatchlist(userId, symbol);
+    }
+
+    private void assertOwner(HttpServletRequest request, long requestedUserId) {
+        Object authenticatedUserId = request.getAttribute(JwtAuthenticationFilter.USER_ID_ATTRIBUTE);
+        if (!(authenticatedUserId instanceof Long userId)) {
+            throw new org.springframework.web.server.ResponseStatusException(HttpStatus.UNAUTHORIZED,
+                    "Authentication is required");
+        }
+        if (requestedUserId != userId) {
+            throw new org.springframework.web.server.ResponseStatusException(HttpStatus.FORBIDDEN,
+                    "You cannot access another user's account");
+        }
     }
 
     public record SignupRequest(String name, String email, String password) { }

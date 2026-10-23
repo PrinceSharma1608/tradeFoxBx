@@ -1,5 +1,7 @@
 package com.tradeFox.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
@@ -24,6 +26,7 @@ import java.util.Map;
 public class AuthService {
     private static final int PASSWORD_ITERATIONS = 210_000;
     private static final SecureRandom RANDOM = new SecureRandom();
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private final JdbcTemplate db;
     private final String jwtSecret;
@@ -62,7 +65,10 @@ public class AuthService {
 
     public Map<String, Object> login(String rawEmail, String password) {
         String email = normalizeEmail(rawEmail);
-        if (!validEmail(email) || password == null || password.length() > 72) {
+        if (email.isBlank() || password == null || password.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Email and password are required");
+        }
+        if (!validEmail(email) || password.length() > 72) {
             throw invalidCredentials();
         }
 
@@ -83,6 +89,39 @@ public class AuthService {
         return authResult(user);
     }
 
+    /** Verifies a signed, unexpired token and returns its active account ID. */
+    public Long userIdForToken(String token) {
+        if (token == null || token.length() > 4096) return null;
+        String[] parts = token.split("\\.", -1);
+        if (parts.length != 3) return null;
+
+        final String email;
+        try {
+            Base64.Decoder decoder = Base64.getUrlDecoder();
+            JsonNode header = JSON.readTree(decoder.decode(parts[0]));
+            JsonNode claims = JSON.readTree(decoder.decode(parts[1]));
+            if (!"HS256".equals(header.path("alg").asText())) return null;
+            JsonNode subject = claims.get("sub");
+            JsonNode expiry = claims.get("exp");
+            if (subject == null || !subject.isTextual() || subject.asText().isBlank()
+                    || expiry == null || !expiry.canConvertToLong()
+                    || expiry.asLong() <= Instant.now().getEpochSecond()) return null;
+
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(jwtSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            byte[] expected = mac.doFinal((parts[0] + "." + parts[1]).getBytes(StandardCharsets.UTF_8));
+            byte[] actual = decoder.decode(parts[2]);
+            if (!MessageDigest.isEqual(expected, actual)) return null;
+            email = normalizeEmail(subject.asText());
+        } catch (Exception exception) {
+            return null;
+        }
+
+        var userIds = db.query("SELECT user_id FROM users WHERE email = ? AND is_active = TRUE",
+                (rs, rowNum) -> rs.getLong("user_id"), email);
+        return userIds.isEmpty() ? null : userIds.getFirst();
+    }
+
     private Map<String, Object> authResult(Map<String, Object> user) {
         Map<String, Object> publicUser = Map.of(
                 "user_id", user.get("user_id"),
@@ -93,8 +132,9 @@ public class AuthService {
 
     private String createToken(String email) {
         try {
-            long issuedAt = Instant.now().getEpochSecond();
-            long expiresAt = Instant.now().plusMillis(tokenLifetimeMs).getEpochSecond();
+            Instant now = Instant.now();
+            long issuedAt = now.getEpochSecond();
+            long expiresAt = now.plusMillis(tokenLifetimeMs).getEpochSecond();
             Base64.Encoder base64 = Base64.getUrlEncoder().withoutPadding();
             String header = encode(base64, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
             String payload = encode(base64, "{\"sub\":\"" + jsonEscape(email) + "\",\"iat\":"

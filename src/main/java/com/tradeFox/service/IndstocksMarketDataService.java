@@ -343,6 +343,25 @@ public class IndstocksMarketDataService {
         }
     }
 
+    /** Returns the configured dashboard equities using the same cache as single-stock requests. */
+    public List<StockQuote> getConfiguredStockQuotes() {
+        if (scripCodes.isBlank()) return List.of();
+        String token = requireAccessToken();
+        List<String> configuredCodes = List.of(scripCodes.split(","));
+        List<String> symbols = getEquityInstrumentAliases(token).values().stream()
+                .distinct()
+                .filter(instrument -> configuredCodes.contains(instrument.scripCode()))
+                .map(Instrument::tradingSymbol)
+                .distinct()
+                .toList();
+        if (symbols.isEmpty()) return List.of();
+        List<StockQuote> quotes = new ArrayList<>();
+        for (int start = 0; start < symbols.size(); start += 100) {
+            quotes.addAll(getStockQuotes(symbols.subList(start, Math.min(start + 100, symbols.size()))));
+        }
+        return List.copyOf(quotes);
+    }
+
     public List<StockSearchResult> searchStocks(String query, int limit) {
         if (query == null || query.isBlank()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Search query is required");
@@ -424,11 +443,30 @@ public class IndstocksMarketDataService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Stock name is required");
         }
 
-        Instrument instrument = getEquityInstrumentAliases(token).get(key);
+        Map<String, Instrument> aliases = getEquityInstrumentAliases(token);
+        Instrument instrument = aliases.get(key);
         if (instrument == null) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Stock not found");
         }
+        if (!scripCodes.isBlank()) {
+            List<String> configuredCodes = List.of(scripCodes.split(","));
+            if (!configuredCodes.contains(instrument.scripCode())) {
+                Instrument configuredMatch = aliases.values().stream()
+                        .distinct()
+                        .filter(candidate -> configuredCodes.contains(candidate.scripCode())
+                                && hasExactAlias(candidate, key))
+                        .sorted(Comparator.comparing(candidate -> !candidate.exchange().equals("NSE")))
+                        .findFirst().orElse(null);
+                if (configuredMatch != null) instrument = configuredMatch;
+            }
+        }
         return instrument;
+    }
+
+    private boolean hasExactAlias(Instrument instrument, String key) {
+        return normalizeName(instrument.tradingSymbol()).equals(key)
+                || normalizeName(instrument.customSymbol()).equals(key)
+                || normalizeName(instrument.symbolName()).equals(key);
     }
 
     private Map<String, Instrument> getEquityInstrumentAliases(String token) {
