@@ -118,8 +118,8 @@ public class ApiController {
 
     @GetMapping("/api/users/{userId}")
     public UserDetails getUserDetails(@PathVariable long userId, HttpServletRequest httpRequest) {
-        assertOwner(httpRequest, userId);
-        return userService.getUserDetails(userId);
+        long authUserId = resolveAuthUserId(httpRequest);
+        return userService.getUserDetails(authUserId);
     }
 
     // --- Portfolio & Order Handshake Endpoints (Persisted in PostgreSQL) ---
@@ -128,14 +128,14 @@ public class ApiController {
     public PortfolioTradingService.OrderResult executeOrder(@RequestBody OrderRequest request,
                                                             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
                                                             HttpServletRequest httpRequest) {
-        assertOwner(httpRequest, request.userId());
+        long userId = resolveAuthUserId(httpRequest);
         return portfolioTradingService.executeOrder(
-                request.userId(),
+                userId,
                 request.stockSymbol(),
                 request.stockName(),
                 request.orderType(),
                 request.price(),
-                request.quantity(),
+                request.quantity() != null ? request.quantity() : 1,
                 request.executionType(),
                 request.marketPrice(),
                 idempotencyKey
@@ -144,71 +144,68 @@ public class ApiController {
 
     @PostMapping("/api/orders/{orderId}/cancel")
     public Map<String, Object> cancelOrder(@PathVariable("orderId") long orderId,
-                                           @RequestParam("userId") long userId,
+                                           @RequestParam(value = "userId", required = false) Long userIdParam,
                                            HttpServletRequest httpRequest) {
-        assertOwner(httpRequest, userId);
+        long userId = resolveAuthUserId(httpRequest);
         return portfolioTradingService.cancelOrder(userId, orderId);
     }
 
     @GetMapping("/api/orders")
-    public List<PortfolioTradingService.OrderItem> getOrders(@RequestParam("userId") long userId,
+    public List<PortfolioTradingService.OrderItem> getOrders(@RequestParam(value = "userId", required = false) Long userIdParam,
                                                              HttpServletRequest httpRequest) {
-        assertOwner(httpRequest, userId);
+        long userId = resolveAuthUserId(httpRequest);
         return portfolioTradingService.getOrders(userId);
     }
 
     @GetMapping("/api/holdings")
-    public List<PortfolioTradingService.HoldingItem> getHoldings(@RequestParam("userId") long userId,
+    public List<PortfolioTradingService.HoldingItem> getHoldings(@RequestParam(value = "userId", required = false) Long userIdParam,
                                                                  HttpServletRequest httpRequest) {
-        assertOwner(httpRequest, userId);
+        long userId = resolveAuthUserId(httpRequest);
         return portfolioTradingService.getHoldings(userId);
     }
 
     @GetMapping("/api/watchlist")
-    public List<PortfolioTradingService.WatchlistDataItem> getWatchlist(@RequestParam("userId") long userId,
+    public List<PortfolioTradingService.WatchlistDataItem> getWatchlist(@RequestParam(value = "userId", required = false) Long userIdParam,
                                                                         HttpServletRequest httpRequest) {
-        assertOwner(httpRequest, userId);
+        long userId = resolveAuthUserId(httpRequest);
         return portfolioTradingService.getWatchlistData(userId);
     }
 
     @PostMapping("/api/watchlist")
     public Map<String, Object> addToWatchlist(@RequestBody WatchlistRequest request,
                                               HttpServletRequest httpRequest) {
-        assertOwner(httpRequest, request.userId());
-        return portfolioTradingService.addToWatchlist(request.userId(), request.stockSymbol(), request.stockName());
+        long userId = resolveAuthUserId(httpRequest);
+        return portfolioTradingService.addToWatchlist(userId, request.stockSymbol(), request.stockName());
     }
 
     @DeleteMapping("/api/watchlist")
-    public Map<String, Object> removeFromWatchlist(@RequestParam("userId") long userId,
+    public Map<String, Object> removeFromWatchlist(@RequestParam(value = "userId", required = false) Long userIdParam,
                                                    @RequestParam("symbol") String symbol,
                                                    HttpServletRequest httpRequest) {
-        assertOwner(httpRequest, userId);
+        long userId = resolveAuthUserId(httpRequest);
         return portfolioTradingService.removeFromWatchlist(userId, symbol);
     }
 
-    private void assertOwner(HttpServletRequest request, long requestedUserId) {
+    private long resolveAuthUserId(HttpServletRequest request) {
         Object authenticatedUserId = request.getAttribute(JwtAuthenticationFilter.USER_ID_ATTRIBUTE);
         if (!(authenticatedUserId instanceof Long userId)) {
             throw new org.springframework.web.server.ResponseStatusException(HttpStatus.UNAUTHORIZED,
                     "Authentication is required");
         }
-        if (requestedUserId != userId) {
-            throw new org.springframework.web.server.ResponseStatusException(HttpStatus.FORBIDDEN,
-                    "You cannot access another user's account");
-        }
+        return userId;
     }
 
     public record SignupRequest(String name, String email, String password) { }
     public record LoginRequest(String email, String password) { }
     public record OrderRequest(
-            long userId,
+            Long userId,
             String stockSymbol,
             String stockName,
             String orderType,
             BigDecimal price,
-            int quantity,
+            Integer quantity,
             String executionType,
             BigDecimal marketPrice
     ) { }
-    public record WatchlistRequest(long userId, String stockSymbol, String stockName) { }
+    public record WatchlistRequest(Long userId, String stockSymbol, String stockName) { }
 }

@@ -25,6 +25,9 @@ import java.nio.charset.StandardCharsets;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -34,6 +37,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import org.springframework.http.HttpStatus;
@@ -41,6 +46,9 @@ import org.springframework.web.server.ResponseStatusException;
 
 @Service
 public class IndstocksMarketDataService {
+    private static final ZoneId MARKET_ZONE = ZoneId.of("Asia/Kolkata");
+    private static final LocalTime MARKET_OPEN = LocalTime.of(9, 15);
+    private static final LocalTime MARKET_CLOSE = LocalTime.of(15, 30);
     private static final Logger log = LoggerFactory.getLogger(IndstocksMarketDataService.class);
     private static final Duration ACCESS_TOKEN_LIFETIME = Duration.ofHours(24);
     private static final Duration TOKEN_REFRESH_BUFFER = Duration.ofMinutes(5);
@@ -87,6 +95,7 @@ public class IndstocksMarketDataService {
     private final String scripCodes;
     private final List<String> websocketInstruments;
     private final Map<String, String> websocketInstrumentNames;
+    private final Set<LocalDate> marketHolidays;
     private final Map<String, Object> indexQuotes = new ConcurrentHashMap<>();
     private final Map<String, Deque<IndexPriceSample>> indexHistory = new ConcurrentHashMap<>();
     private final Map<String, CachedStockQuote> stockQuoteCache = new ConcurrentHashMap<>();
@@ -112,7 +121,8 @@ public class IndstocksMarketDataService {
             @Value("${indstocks.mpin:}") String mpin,
             @Value("${indstocks.totp-secret:}") String totpSecret,
             @Value("${indstocks.scrip-codes:}") String scripCodes,
-            @Value("${indstocks.websocket-instruments:}") String websocketInstruments) {
+            @Value("${indstocks.websocket-instruments:}") String websocketInstruments,
+            @Value("${indstocks.market-holidays:}") String marketHolidays) {
         this.apiBaseUrl = apiBaseUrl;
         this.objectMapper = new ObjectMapper();
         this.clientId = clientId.trim();
@@ -121,11 +131,23 @@ public class IndstocksMarketDataService {
         this.scripCodes = normalizeScripCodes(scripCodes);
         this.websocketInstruments = parseWebsocketInstruments(websocketInstruments);
         this.websocketInstrumentNames = createWebsocketInstrumentNames(this.websocketInstruments);
+        this.marketHolidays = parseMarketHolidays(marketHolidays);
+    }
+
+    /** NSE regular equity session in India Standard Time; holidays can be configured as YYYY-MM-DD values. */
+    public boolean isMarketOpen() {
+        var now = java.time.ZonedDateTime.now(MARKET_ZONE);
+        LocalTime time = now.toLocalTime();
+        return now.getDayOfWeek().getValue() <= 5
+                && !marketHolidays.contains(now.toLocalDate())
+                && !time.isBefore(MARKET_OPEN)
+                && time.isBefore(MARKET_CLOSE);
     }
 
     /** Creates a token at startup, then refreshes shortly before the 24-hour expiry. */
     @Scheduled(fixedDelayString = "${indstocks.token-check-ms:60000}")
     public synchronized void refreshTokenIfNeeded() {
+        if (!isMarketOpen()) return;
         if (clientId.isBlank() || mpin.isBlank() || totpSecret.isBlank()) {
             if (!reportedMissingCredentials) {
                 log.info("INDstocks token generation is waiting for INDSTOCKS_CLIENT_ID, INDSTOCKS_MPIN and INDSTOCKS_TOTP_SECRET.");
@@ -185,6 +207,10 @@ public class IndstocksMarketDataService {
     /** Fetches one quote snapshot per backend instance, not once per frontend visitor. */
     @Scheduled(fixedDelayString = "${indstocks.market-refresh-ms:60000}", initialDelay = 5000)
     public void refreshMarketData() {
+        if (!isMarketOpen()) {
+            disconnectPriceSocket();
+            return;
+        }
         String token = accessToken;
         if (token == null || token.isBlank()) return;
         connectPriceSocketIfNeeded(token);
@@ -300,7 +326,9 @@ public class IndstocksMarketDataService {
         if (stockName == null || stockName.isBlank()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Stock name is required");
         }
-        return getStockQuotes(List.of(stockName)).getFirst();
+        List<StockQuote> quotes = getStockQuotes(List.of(stockName));
+        if (quotes.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Stock not found");
+        return quotes.getFirst();
     }
 
     public List<StockQuote> getStockQuotes(List<String> stockNames) {
@@ -311,14 +339,23 @@ public class IndstocksMarketDataService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "A maximum of 100 stocks can be requested");
         }
 
-        String token = requireAccessToken();
+        boolean marketOpen = isMarketOpen();
+        String token = marketOpen ? requireAccessToken() : accessToken;
         Map<String, Instrument> instrumentsByCode = new LinkedHashMap<>();
         for (String stockName : stockNames) {
             if (stockName == null || stockName.isBlank()) {
                 throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Stock symbols cannot be blank");
             }
-            Instrument instrument = findInstrument(stockName, token);
-            instrumentsByCode.putIfAbsent(instrument.scripCode(), instrument);
+            try {
+                Instrument instrument = marketOpen
+                        ? findInstrument(stockName, token)
+                        : findCachedInstrument(stockName);
+                if (instrument != null) {
+                    instrumentsByCode.putIfAbsent(instrument.scripCode(), instrument);
+                }
+            } catch (ResponseStatusException exception) {
+                if (exception.getStatusCode() != HttpStatus.NOT_FOUND) throw exception;
+            }
         }
 
         synchronized (stockQuoteLock) {
@@ -327,9 +364,13 @@ public class IndstocksMarketDataService {
             List<Instrument> instrumentsToFetch = new ArrayList<>();
             for (Instrument instrument : instrumentsByCode.values()) {
                 CachedStockQuote cached = stockQuoteCache.get(instrument.scripCode());
-                if (cached != null && now.isBefore(cached.fetchedAt().plusSeconds(60))) {
+                if (cached != null && (!marketOpen || now.isBefore(cached.fetchedAt().plusSeconds(60)))) {
                     quotesByCode.put(instrument.scripCode(), cached.quote());
                 } else {
+                    if (!marketOpen) {
+                        throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                                "Market is closed and no recent quote is available");
+                    }
                     instrumentsToFetch.add(instrument);
                 }
             }
@@ -339,16 +380,18 @@ public class IndstocksMarketDataService {
                 quotesByCode.put(entry.getKey(), entry.getValue());
                 stockQuoteCache.put(entry.getKey(), new CachedStockQuote(entry.getValue(), entry.getValue().updatedAt()));
             }
-            return instrumentsByCode.keySet().stream().map(quotesByCode::get).toList();
+            return instrumentsByCode.keySet().stream()
+                    .map(quotesByCode::get)
+                    .filter(java.util.Objects::nonNull)
+                    .toList();
         }
     }
 
     /** Returns the configured dashboard equities using the same cache as single-stock requests. */
     public List<StockQuote> getConfiguredStockQuotes() {
         if (scripCodes.isBlank()) return List.of();
-        String token = requireAccessToken();
         List<String> configuredCodes = List.of(scripCodes.split(","));
-        List<String> symbols = getEquityInstrumentAliases(token).values().stream()
+        List<String> symbols = getEquityInstrumentAliases(isMarketOpen() ? requireAccessToken() : accessToken).values().stream()
                 .distinct()
                 .filter(instrument -> configuredCodes.contains(instrument.scripCode()))
                 .map(Instrument::tradingSymbol)
@@ -370,7 +413,7 @@ public class IndstocksMarketDataService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Limit must be between 1 and 50");
         }
 
-        String token = requireAccessToken();
+        String token = isMarketOpen() ? requireAccessToken() : accessToken;
         String search = normalizeName(query);
         return getEquityInstrumentAliases(token).values().stream()
                 .distinct()
@@ -476,6 +519,7 @@ public class IndstocksMarketDataService {
             synchronized (instrumentMasterLock) {
                 fetchedAt = instrumentMasterFetchedAt;
                 if (fetchedAt == null || Instant.now().isAfter(fetchedAt.plus(Duration.ofHours(24)))) {
+                    if (!isMarketOpen() && !instrumentAliases.isEmpty()) return instrumentAliases;
                     String csv = getProviderResource("/market/instruments?source=equity", token);
                     aliases = parseInstrumentMaster(csv);
                     instrumentAliases = aliases;
@@ -745,6 +789,7 @@ public class IndstocksMarketDataService {
     }
 
     private String getProviderResource(String path, String token) {
+        requireMarketOpenForProviderCall();
         HttpRequest request = HttpRequest.newBuilder(URI.create(apiBaseUrl + path))
                 .timeout(Duration.ofSeconds(15))
                 .header("Authorization", token)
@@ -820,6 +865,7 @@ public class IndstocksMarketDataService {
     }
 
     private synchronized void connectPriceSocketIfNeeded(String token) {
+        if (!isMarketOpen()) return;
         if (websocketInstruments.isEmpty()) return;
         if (token.equals(priceSocketToken) && priceSocket != null
                 && !priceSocket.isInputClosed() && !priceSocket.isOutputClosed()) return;
@@ -856,6 +902,50 @@ public class IndstocksMarketDataService {
         } catch (Exception exception) {
             connectingSocketToken = null;
             log.warn("Could not start the INDstocks index price stream.");
+        }
+    }
+
+    private synchronized void disconnectPriceSocket() {
+        WebSocket socket = priceSocket;
+        priceSocket = null;
+        priceSocketToken = null;
+        connectingSocketToken = null;
+        if (socket != null && !socket.isOutputClosed()) {
+            try {
+                socket.sendClose(WebSocket.NORMAL_CLOSURE, "Market closed");
+            } catch (Exception ignored) {
+                // A socket may close between checking its state and sending the close frame.
+            }
+        }
+    }
+
+    private void requireMarketOpenForProviderCall() {
+        if (!isMarketOpen()) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "Market data is available from 09:15 to 15:30 IST on configured trading days");
+        }
+    }
+
+    private Instrument findCachedInstrument(String stockName) {
+        String key = normalizeName(stockName);
+        Instrument instrument = instrumentAliases.get(key);
+        if (instrument == null) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "Market is closed and this stock is not in the cached instrument list");
+        }
+        return instrument;
+    }
+
+    private Set<LocalDate> parseMarketHolidays(String configured) {
+        if (configured == null || configured.isBlank()) return Set.of();
+        try {
+            return java.util.Arrays.stream(configured.split(","))
+                    .map(String::trim)
+                    .filter(value -> !value.isEmpty())
+                    .map(LocalDate::parse)
+                    .collect(Collectors.toUnmodifiableSet());
+        } catch (RuntimeException exception) {
+            throw new IllegalArgumentException("INDSTOCKS_MARKET_HOLIDAYS must be comma-separated YYYY-MM-DD dates");
         }
     }
 

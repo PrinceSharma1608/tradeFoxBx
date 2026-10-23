@@ -34,8 +34,14 @@ public class StockDetailService {
     public Map<String, Object> getLiveMarketQuotes() {
         IndstocksMarketDataService.MarketStatus status = marketDataService.getMarketStatus();
         Map<String, Object> quotesBySymbol = new LinkedHashMap<>();
-        List<IndstocksMarketDataService.StockQuote> quotes = status.tokenReady()
-                ? marketDataService.getConfiguredStockQuotes() : List.of();
+        List<IndstocksMarketDataService.StockQuote> quotes = List.of();
+        if (status.tokenReady() || !marketDataService.isMarketOpen()) {
+            try {
+                quotes = marketDataService.getConfiguredStockQuotes();
+            } catch (ResponseStatusException ignored) {
+                // After hours, show an empty snapshot if this process has no cached market data yet.
+            }
+        }
         for (IndstocksMarketDataService.StockQuote quote : quotes) {
             Map<String, Object> data = new LinkedHashMap<>();
             data.put("symbol", quote.stockSymbol());
@@ -117,6 +123,7 @@ public class StockDetailService {
     /** Reprices pending paper limit orders from INDstocks quotes; no broker order API is called. */
     @Scheduled(fixedDelayString = "${indstocks.market-refresh-ms:60000}", initialDelay = 15000)
     public void executeTriggeredPaperOrders() {
+        if (!marketDataService.isMarketOpen()) return;
         List<String> symbols = portfolioTradingService.getPendingStockSymbols();
         if (symbols.isEmpty()) return;
         try {
@@ -128,7 +135,12 @@ public class StockDetailService {
                     prices.put(quote.stockSymbol().toUpperCase(Locale.ROOT), quote.price());
                 }
             }
-            portfolioTradingService.checkAndExecutePendingLimitOrders(prices);
+            for (String symbol : symbols) {
+                if (!prices.containsKey(symbol.toUpperCase(Locale.ROOT))) {
+                    portfolioTradingService.rejectPendingOrdersForUnsupportedSymbol(symbol);
+                }
+            }
+            portfolioTradingService.checkAndExecutePendingOrders(prices);
         } catch (Exception exception) {
             log.warn("Pending paper orders were not checked because current quotes are unavailable.");
         }

@@ -20,9 +20,10 @@ The two instrument lists above use documentation examples. Confirm the IDs for t
 
 ## Runtime behavior
 
-- On startup, and then shortly before the 24-hour expiry, the backend creates a token with `/generate/token` using the saved TOTP secret and the current six-digit code. Failed attempts back off for five minutes to avoid repeated TOTP lockouts.
+- The token scheduler stays active at all times, but calls `/generate/token` only during the NSE regular session (09:15–15:30 IST, weekdays, excluding configured holidays). A token is generated at the next session if the backend starts after hours or the prior token expires while the market is closed. Failed attempts back off for five minutes to avoid repeated TOTP lockouts.
 - INDstocks keeps only one TOTP-generated token live. Run one backend instance for this integration; a second instance would invalidate the first instance's token.
-- The backend fetches configured REST quotes once per minute and keeps the latest successful response in memory. Index LTPs are updated from one backend price-feed WebSocket.
+- Backend endpoints remain available 24/7. The backend fetches configured REST quotes once per minute during the NSE regular session and keeps the latest successful response in memory. It closes the index price-feed WebSocket outside that session. After hours, quote endpoints return cached values when available; they do not call INDstocks.
+- Market hours use Asia/Kolkata time, Monday to Friday, 09:15 inclusive to 15:30 exclusive. Configure exchange holidays with `INDSTOCKS_MARKET_HOLIDAYS` as comma-separated `YYYY-MM-DD` dates.
 - The frontend should request `GET /api/market/quotes` from this backend about once per minute. It should never call INDstocks directly or receive the broker credentials.
 - The quote cache is in memory, so it starts empty after an application restart. No market data is written to PostgreSQL.
 
@@ -48,11 +49,11 @@ These are read-only market-data endpoints. They do not place, modify, or cancel 
 
 - `POST /api/auth/signup` and `POST /api/auth/login` are public. Successful responses contain a signed, expiring JWT.
 - Empty login fields return HTTP 400; invalid credentials return HTTP 401.
-- `POST /api/orders` writes only to this application's PostgreSQL tables. It never sends orders to INDstocks. A market paper order uses the current provider quote; a limit order uses its submitted limit price and the current provider quote only to decide whether it should wait.
+- `POST /api/orders` writes only to this application's PostgreSQL tables. It never sends orders to INDstocks. Market orders placed while the exchange is closed and limit orders waiting for their price are kept in `pending_orders`; BUY funds and SELL shares are reserved while they wait. During market hours, a once-per-minute worker reads queued orders, executes eligible paper trades at provider prices, updates holdings and wallet balances, and inserts the transaction. A market BUY that gaps above its reserved reference amount is rejected and refunded.
 - Send an `Idempotency-Key` header when creating an order. Repeating the same key and body returns the original order; reusing that key with different order details returns HTTP 409. An immediate identical retry without a key is also absorbed for five seconds.
 - Wallet reads are locked during paper order updates, and holdings are unique by `(user_id, stock_symbol)`.
 
-The PostgreSQL repair for existing databases is in `database/portfolio_schema_patch.sql`. Run it once on a database that has the supplied tables before using these endpoints. The connected project database has already been updated.
+The PostgreSQL repair for existing databases is in `database/portfolio_schema_patch.sql`. Run it once on a database that has the supplied tables before using these endpoints; it creates `pending_orders` and moves existing pending orders into the queue as limit orders.
 
 The frontend should call these backend endpoints; it must not receive the INDstocks access token or credentials. Refresh the overview and index endpoints about once per minute. Historical candles can be requested when a chart is opened or when its interval/date range changes.
 

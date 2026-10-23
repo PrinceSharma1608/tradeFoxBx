@@ -36,4 +36,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS orders_user_idempotency_key_unique
     ON orders (user_id, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
 
+-- Durable queue for market orders waiting for the next session and untriggered limit orders.
+CREATE TABLE IF NOT EXISTS pending_orders (
+    order_id INTEGER PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE,
+    execution_type VARCHAR(6) NOT NULL CHECK (execution_type IN ('MARKET', 'LIMIT')),
+    queued_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Older pending orders were limit orders; keep them in the new queue during the migration.
+INSERT INTO pending_orders (order_id, execution_type)
+SELECT order_id, 'LIMIT'
+FROM orders
+WHERE order_status = 'PENDING'
+ON CONFLICT (order_id) DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS pending_orders_queued_at_idx ON pending_orders (queued_at, order_id);
+
 COMMIT;

@@ -2,6 +2,8 @@ package com.tradeFox.service;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
@@ -24,10 +26,13 @@ public class PortfolioTradingService {
 
     private final JdbcTemplate db;
     private final IndstocksMarketDataService marketDataService;
+    private final TransactionTemplate transactionTemplate;
 
-    public PortfolioTradingService(JdbcTemplate db, IndstocksMarketDataService marketDataService) {
+    public PortfolioTradingService(JdbcTemplate db, IndstocksMarketDataService marketDataService,
+                                   PlatformTransactionManager transactionManager) {
         this.db = db;
         this.marketDataService = marketDataService;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     private static final Map<String, String> CANONICAL_STOCK_NAMES = Map.ofEntries(
@@ -168,7 +173,7 @@ public class PortfolioTradingService {
     @Transactional
     public OrderResult executeOrder(long userId, String rawSymbol, String rawName,
                                     String rawOrderType, BigDecimal requestedPrice, int quantity,
-                                    String rawExecutionType, BigDecimal ignoredClientMarketPrice,
+                                    String rawExecutionType, BigDecimal clientMarketPrice,
                                     String rawIdempotencyKey) {
         if (userId <= 0) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Valid user ID is required");
@@ -225,22 +230,42 @@ public class PortfolioTradingService {
             }
         }
 
-        IndstocksMarketDataService.StockQuote quote;
-        try {
-            quote = marketDataService.getStockQuote(symbol);
-        } catch (ResponseStatusException exception) {
-            if (exception.getStatusCode() == HttpStatus.NOT_FOUND) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unsupported stock symbol");
+        boolean marketOpen = marketDataService.isMarketOpen();
+        IndstocksMarketDataService.StockQuote quote = null;
+        if (marketOpen) {
+            try {
+                quote = marketDataService.getStockQuote(symbol);
+            } catch (ResponseStatusException exception) {
+                if (exception.getStatusCode() == HttpStatus.NOT_FOUND) {
+                    throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Unsupported stock symbol");
+                }
+                throw exception;
             }
-            throw exception;
+            if (quote.price() == null || quote.price().compareTo(BigDecimal.ZERO) <= 0) {
+                throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "Market provider returned an invalid stock price");
+            }
+        } else {
+            try {
+                // This path is cache-only while the market is closed; it never calls INDstocks.
+                quote = marketDataService.getStockQuote(symbol);
+            } catch (ResponseStatusException ignored) {
+                // A user-supplied reference price can still queue the order if this process has no cached quote.
+            }
         }
-        if (quote.price() == null || quote.price().compareTo(BigDecimal.ZERO) <= 0) {
-            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, "Market provider returned an invalid stock price");
+
+        BigDecimal referencePrice = firstPositivePrice(clientMarketPrice, requestedPrice,
+                quote == null ? null : quote.price());
+        if ("LIMIT".equals(executionType)) referencePrice = limitPrice;
+        if (!marketOpen && referencePrice == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "A positive reference price is required while the market is closed");
         }
-        String name = quote.stockName();
-        BigDecimal price = "LIMIT".equals(executionType)
-                ? limitPrice : quote.price().setScale(2, RoundingMode.HALF_UP);
-        BigDecimal effectiveMarketPrice = quote.price();
+        String name = quote != null ? quote.stockName() : resolveStockName(symbol, rawName);
+        BigDecimal livePrice = quote == null ? null : quote.price().setScale(2, RoundingMode.HALF_UP);
+        BigDecimal price = "LIMIT".equals(executionType) ? limitPrice
+                : (marketOpen ? livePrice : referencePrice.setScale(2, RoundingMode.HALF_UP));
+        if (referencePrice == null) referencePrice = price;
+        BigDecimal effectiveMarketPrice = quote == null ? null : quote.price();
         BigDecimal totalAmount = price.multiply(BigDecimal.valueOf(quantity)).setScale(2, RoundingMode.HALF_UP);
         if (price.compareTo(MAX_ORDER_AMOUNT) > 0 || totalAmount.compareTo(MAX_ORDER_AMOUNT) > 0) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Order amount exceeds the supported limit");
@@ -297,9 +322,9 @@ public class PortfolioTradingService {
 
         // Check if LIMIT condition is satisfied immediately or should remain PENDING
         boolean isLimitOrder = "LIMIT".equals(executionType);
-        boolean shouldRemainPending = false;
+        boolean shouldRemainPending = !marketOpen;
 
-        if (isLimitOrder) {
+        if (marketOpen && isLimitOrder) {
             if ("BUY".equals(orderType)) {
                 // BUY Limit triggers when market price drops to or below target limit price
                 if (effectiveMarketPrice.compareTo(price) > 0) {
@@ -333,10 +358,17 @@ public class PortfolioTradingService {
         } else {
             // SELL Order: Validate holding availability
             List<HoldingItem> existingHoldings = getHoldingItemsForStock(userId, symbol);
-            if (existingHoldings.isEmpty() || existingHoldings.getFirst().quantity() < quantity) {
-                int available = existingHoldings.isEmpty() ? 0 : existingHoldings.getFirst().quantity();
+            int heldQuantity = existingHoldings.isEmpty() ? 0 : existingHoldings.getFirst().quantity();
+            Integer reservedQuantity = db.queryForObject("""
+                    SELECT COALESCE(SUM(o.quantity), 0)
+                    FROM pending_orders p JOIN orders o ON o.order_id = p.order_id
+                    WHERE o.user_id = ? AND o.stock_symbol = ? AND o.order_type = 'SELL'
+                    """, Integer.class, userId, symbol);
+            int availableQuantity = heldQuantity - (reservedQuantity == null ? 0 : reservedQuantity);
+            if (availableQuantity < quantity) {
                 throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                        String.format("Insufficient shares to sell. Available: %d, Requested: %d", available, quantity));
+                        String.format("Insufficient unreserved shares to sell. Available: %d, Requested: %d",
+                                Math.max(availableQuantity, 0), quantity));
             }
 
             if (!shouldRemainPending) {
@@ -364,6 +396,11 @@ public class PortfolioTradingService {
                 finalStatus, idempotencyKey, requestHash
         );
 
+        if (shouldRemainPending) {
+            db.update("INSERT INTO pending_orders (order_id, execution_type) VALUES (?, ?)",
+                    orderId, executionType);
+        }
+
         if (!shouldRemainPending) {
             // Insert Transaction Record
             long stockId = Math.abs((long) symbol.hashCode());
@@ -375,7 +412,8 @@ public class PortfolioTradingService {
         }
 
         String message = shouldRemainPending
-                ? String.format("Limit %s order placed for %d %s @ ₹%s (Trigger pending)", orderType, quantity, symbol, price.toPlainString())
+                ? String.format("%s %s order queued for %d %s @ ₹%s", executionType, orderType,
+                        quantity, symbol, price.toPlainString())
                 : String.format("%s order executed successfully for %d %s @ ₹%s", orderType, quantity, symbol, price.toPlainString());
 
         return new OrderResult(
@@ -399,6 +437,13 @@ public class PortfolioTradingService {
         return new OrderResult(order.orderId(), order.userId(), order.symbol(), order.name(),
                 order.type(), order.price(), order.quantity(), total, currentBalance,
                 order.status(), "Duplicate request; returned the existing order.");
+    }
+
+    private BigDecimal firstPositivePrice(BigDecimal... prices) {
+        for (BigDecimal price : prices) {
+            if (price != null && price.compareTo(BigDecimal.ZERO) > 0) return price;
+        }
+        return null;
     }
 
     private List<StoredOrder> findOrderByIdempotencyKey(long userId, String idempotencyKey) {
@@ -496,18 +541,17 @@ public class PortfolioTradingService {
         );
     }
 
-    /**
-     * Ticking Trigger Engine:
-     * Scans and executes all PENDING Limit Orders when the market ticks past the order trigger price!
-     */
-    @Transactional
-    public int checkAndExecutePendingLimitOrders(Map<String, BigDecimal> currentPrices) {
+    /** Settles queued paper orders against the latest market prices, one database transaction per order. */
+    public int checkAndExecutePendingOrders(Map<String, BigDecimal> currentPrices) {
+        if (!marketDataService.isMarketOpen()) return 0;
         if (currentPrices == null || currentPrices.isEmpty()) return 0;
 
         List<PendingOrder> pending = db.query("""
-                SELECT order_id, user_id, stock_symbol, stock_name, order_type, order_price, quantity
-                FROM orders
-                WHERE order_status = 'PENDING'
+                SELECT o.order_id, o.user_id, o.stock_symbol, o.stock_name, o.order_type,
+                       o.order_price, o.quantity, p.execution_type
+                FROM pending_orders p JOIN orders o ON o.order_id = p.order_id
+                WHERE o.order_status = 'PENDING'
+                ORDER BY p.queued_at, o.order_id
                 """,
                 (rs, rowNum) -> new PendingOrder(
                         rs.getLong("order_id"),
@@ -516,53 +560,61 @@ public class PortfolioTradingService {
                         rs.getString("stock_name"),
                         rs.getString("order_type"),
                         rs.getBigDecimal("order_price"),
-                        rs.getInt("quantity")
+                        rs.getInt("quantity"),
+                        rs.getString("execution_type")
                 )
         );
 
         int executedCount = 0;
         for (PendingOrder po : pending) {
-            BigDecimal ltp = currentPrices.get(po.stockSymbol());
+            BigDecimal ltp = currentPrices.get(po.stockSymbol().toUpperCase(Locale.ROOT));
             if (ltp == null || ltp.compareTo(BigDecimal.ZERO) <= 0) continue;
 
-            boolean triggered = false;
-            if ("BUY".equalsIgnoreCase(po.orderType()) && ltp.compareTo(po.orderPrice()) <= 0) {
-                triggered = true;
-            } else if ("SELL".equalsIgnoreCase(po.orderType()) && ltp.compareTo(po.orderPrice()) >= 0) {
-                triggered = true;
-            }
+            boolean triggered = "MARKET".equalsIgnoreCase(po.executionType())
+                    || ("BUY".equalsIgnoreCase(po.orderType()) && ltp.compareTo(po.orderPrice()) <= 0)
+                    || ("SELL".equalsIgnoreCase(po.orderType()) && ltp.compareTo(po.orderPrice()) >= 0);
 
             if (triggered) {
                 try {
-                    executePendingOrder(po, ltp);
-                    executedCount++;
+                    final boolean[] executed = {false};
+                    transactionTemplate.executeWithoutResult(status ->
+                            executed[0] = executePendingOrder(po, ltp));
+                    if (executed[0]) executedCount++;
                 } catch (Exception ex) {
-                    System.err.println("Could not trigger pending order #" + po.orderId() + ": " + ex.getMessage());
+                    // One bad order must not block other users' queued orders.
                 }
             }
         }
         return executedCount;
     }
 
-    private void executePendingOrder(PendingOrder po, BigDecimal executionPrice) {
-        db.query("SELECT user_id FROM users WHERE user_id = ? FOR UPDATE",
+    private boolean executePendingOrder(PendingOrder po, BigDecimal executionPrice) {
+        List<Long> lockedUsers = db.query("SELECT user_id FROM users WHERE user_id = ? FOR UPDATE",
                 (rs, rowNum) -> rs.getLong("user_id"), po.userId());
+        if (lockedUsers.isEmpty()) return false;
         List<PendingOrder> stillPending = db.query("""
-                        SELECT order_id, user_id, stock_symbol, stock_name, order_type, order_price, quantity
-                        FROM orders WHERE order_id = ? AND order_status = 'PENDING' FOR UPDATE
+                        SELECT o.order_id, o.user_id, o.stock_symbol, o.stock_name, o.order_type,
+                               o.order_price, o.quantity, p.execution_type
+                        FROM orders o JOIN pending_orders p ON p.order_id = o.order_id
+                        WHERE o.order_id = ? AND o.order_status = 'PENDING' FOR UPDATE OF o
                         """,
                 (rs, rowNum) -> new PendingOrder(rs.getLong("order_id"), rs.getLong("user_id"),
                         rs.getString("stock_symbol"), rs.getString("stock_name"), rs.getString("order_type"),
-                        rs.getBigDecimal("order_price"), rs.getInt("quantity")), po.orderId());
-        if (stillPending.isEmpty()) return;
+                        rs.getBigDecimal("order_price"), rs.getInt("quantity"), rs.getString("execution_type")), po.orderId());
+        if (stillPending.isEmpty()) return false;
         po = stillPending.getFirst();
         BigDecimal totalAmount = executionPrice.multiply(BigDecimal.valueOf(po.quantity())).setScale(2, RoundingMode.HALF_UP);
         long stockId = Math.abs((long) po.stockSymbol().hashCode());
 
         if ("BUY".equalsIgnoreCase(po.orderType())) {
-            // Funds were already held when placing the pending limit order.
-            // If executed at a better price, refund the surplus difference!
+            // Funds were reserved when queued; reject and refund if a market order gaps above the reserve.
             BigDecimal initialHeld = po.orderPrice().multiply(BigDecimal.valueOf(po.quantity())).setScale(2, RoundingMode.HALF_UP);
+            if (totalAmount.compareTo(initialHeld) > 0) {
+                db.update("UPDATE users SET wallet_balance = wallet_balance + ? WHERE user_id = ?", initialHeld, po.userId());
+                db.update("UPDATE orders SET order_status = 'REJECTED' WHERE order_id = ?", po.orderId());
+                db.update("DELETE FROM pending_orders WHERE order_id = ?", po.orderId());
+                return false;
+            }
             if (initialHeld.compareTo(totalAmount) > 0) {
                 BigDecimal refundDiff = initialHeld.subtract(totalAmount);
                 db.update("UPDATE users SET wallet_balance = wallet_balance + ? WHERE user_id = ?", refundDiff, po.userId());
@@ -573,24 +625,74 @@ public class PortfolioTradingService {
             List<HoldingItem> existing = getHoldingItemsForStock(po.userId(), po.stockSymbol());
             if (existing.isEmpty() || existing.getFirst().quantity() < po.quantity()) {
                 db.update("UPDATE orders SET order_status = 'REJECTED' WHERE order_id = ?", po.orderId());
-                return;
+                db.update("DELETE FROM pending_orders WHERE order_id = ?", po.orderId());
+                return false;
             }
-            db.update("UPDATE users SET wallet_balance = wallet_balance + ? WHERE user_id = ?", totalAmount, po.userId());
             BigDecimal resultingBalance = db.queryForObject("SELECT wallet_balance FROM users WHERE user_id = ?",
                     BigDecimal.class, po.userId());
-            if (resultingBalance != null && resultingBalance.compareTo(MAX_WALLET_BALANCE) > 0) {
-                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Wallet balance exceeds the supported limit");
+            if (resultingBalance != null && resultingBalance.add(totalAmount).compareTo(MAX_WALLET_BALANCE) > 0) {
+                db.update("UPDATE orders SET order_status = 'REJECTED' WHERE order_id = ?", po.orderId());
+                db.update("DELETE FROM pending_orders WHERE order_id = ?", po.orderId());
+                return false;
             }
+            db.update("UPDATE users SET wallet_balance = wallet_balance + ? WHERE user_id = ?", totalAmount, po.userId());
             updateHoldingOnSell(po.userId(), po.stockSymbol(), po.quantity(), existing.getFirst());
         }
 
-        db.update("UPDATE orders SET order_status = 'EXECUTED' WHERE order_id = ?", po.orderId());
+        db.update("UPDATE orders SET order_status = 'EXECUTED', order_price = ? WHERE order_id = ?",
+                executionPrice.setScale(2, RoundingMode.HALF_UP), po.orderId());
+        db.update("DELETE FROM pending_orders WHERE order_id = ?", po.orderId());
 
         db.update("""
                 INSERT INTO transactions (user_id, stock_id, transaction_type, price, quantity, transaction_time)
                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 po.userId(), stockId, po.orderType(), executionPrice, po.quantity());
+        return true;
+    }
+
+    /** Releases queued orders whose symbols the provider confirms are unsupported. */
+    public int rejectPendingOrdersForUnsupportedSymbol(String symbol) {
+        List<PendingOrder> pending = db.query("""
+                SELECT o.order_id, o.user_id, o.stock_symbol, o.stock_name, o.order_type,
+                       o.order_price, o.quantity, p.execution_type
+                FROM pending_orders p JOIN orders o ON o.order_id = p.order_id
+                WHERE o.stock_symbol = ? AND o.order_status = 'PENDING'
+                """,
+                (rs, rowNum) -> new PendingOrder(rs.getLong("order_id"), rs.getLong("user_id"),
+                        rs.getString("stock_symbol"), rs.getString("stock_name"), rs.getString("order_type"),
+                        rs.getBigDecimal("order_price"), rs.getInt("quantity"), rs.getString("execution_type")),
+                symbol);
+        int rejectedCount = 0;
+        for (PendingOrder order : pending) {
+            Boolean rejected = transactionTemplate.execute(status -> {
+                db.query("SELECT user_id FROM users WHERE user_id = ? FOR UPDATE",
+                        (rs, rowNum) -> rs.getLong("user_id"), order.userId());
+                List<PendingOrder> current = db.query("""
+                                SELECT o.order_id, o.user_id, o.stock_symbol, o.stock_name, o.order_type,
+                                       o.order_price, o.quantity, p.execution_type
+                                FROM orders o JOIN pending_orders p ON p.order_id = o.order_id
+                                WHERE o.order_id = ? AND o.order_status = 'PENDING' FOR UPDATE OF o
+                                """,
+                        (rs, rowNum) -> new PendingOrder(rs.getLong("order_id"), rs.getLong("user_id"),
+                                rs.getString("stock_symbol"), rs.getString("stock_name"), rs.getString("order_type"),
+                                rs.getBigDecimal("order_price"), rs.getInt("quantity"), rs.getString("execution_type")),
+                        order.orderId());
+                if (current.isEmpty()) return false;
+                PendingOrder queued = current.getFirst();
+                if ("BUY".equalsIgnoreCase(queued.orderType())) {
+                    BigDecimal refund = queued.orderPrice().multiply(BigDecimal.valueOf(queued.quantity()))
+                            .setScale(2, RoundingMode.HALF_UP);
+                    db.update("UPDATE users SET wallet_balance = wallet_balance + ? WHERE user_id = ?",
+                            refund, queued.userId());
+                }
+                db.update("UPDATE orders SET order_status = 'REJECTED' WHERE order_id = ?", queued.orderId());
+                db.update("DELETE FROM pending_orders WHERE order_id = ?", queued.orderId());
+                return true;
+            });
+            if (Boolean.TRUE.equals(rejected)) rejectedCount++;
+        }
+        return rejectedCount;
     }
 
     /**
@@ -598,10 +700,14 @@ public class PortfolioTradingService {
      */
     @Transactional
     public Map<String, Object> cancelOrder(long userId, long orderId) {
+        db.query("SELECT user_id FROM users WHERE user_id = ? FOR UPDATE",
+                (rs, rowNum) -> rs.getLong("user_id"), userId);
         List<PendingOrder> list = db.query("""
-                SELECT order_id, user_id, stock_symbol, stock_name, order_type, order_price, quantity
-                FROM orders
-                WHERE order_id = ? AND user_id = ? AND order_status = 'PENDING'
+                SELECT o.order_id, o.user_id, o.stock_symbol, o.stock_name, o.order_type,
+                       o.order_price, o.quantity, p.execution_type
+                FROM orders o JOIN pending_orders p ON p.order_id = o.order_id
+                WHERE o.order_id = ? AND o.user_id = ? AND o.order_status = 'PENDING'
+                FOR UPDATE OF o
                 """,
                 (rs, rowNum) -> new PendingOrder(
                         rs.getLong("order_id"),
@@ -610,7 +716,8 @@ public class PortfolioTradingService {
                         rs.getString("stock_name"),
                         rs.getString("order_type"),
                         rs.getBigDecimal("order_price"),
-                        rs.getInt("quantity")
+                        rs.getInt("quantity"),
+                        rs.getString("execution_type")
                 ),
                 orderId, userId
         );
@@ -626,6 +733,7 @@ public class PortfolioTradingService {
         }
 
         db.update("UPDATE orders SET order_status = 'CANCELLED' WHERE order_id = ?", orderId);
+        db.update("DELETE FROM pending_orders WHERE order_id = ?", orderId);
 
         BigDecimal currentBalance = db.queryForObject(
                 "SELECT wallet_balance FROM users WHERE user_id = ?",
@@ -641,7 +749,8 @@ public class PortfolioTradingService {
         return result;
     }
 
-    public record PendingOrder(long orderId, long userId, String stockSymbol, String stockName, String orderType, BigDecimal orderPrice, int quantity) { }
+    public record PendingOrder(long orderId, long userId, String stockSymbol, String stockName,
+                               String orderType, BigDecimal orderPrice, int quantity, String executionType) { }
 
     public List<HoldingItem> getHoldings(long userId) {
         if (userId <= 0) {
@@ -723,7 +832,11 @@ public class PortfolioTradingService {
     }
 
     public List<String> getPendingStockSymbols() {
-        return db.query("SELECT DISTINCT stock_symbol FROM orders WHERE order_status = 'PENDING' ORDER BY stock_symbol",
+        return db.query("""
+                SELECT DISTINCT o.stock_symbol FROM pending_orders p
+                JOIN orders o ON o.order_id = p.order_id
+                WHERE o.order_status = 'PENDING' ORDER BY o.stock_symbol
+                """,
                 (rs, rowNum) -> rs.getString("stock_symbol"));
     }
 
@@ -777,17 +890,22 @@ public class PortfolioTradingService {
                 (rs, rowNum) -> rs.getLong("user_id"), userId);
         if (activeUsers.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Active user not found");
 
-        IndstocksMarketDataService.StockQuote quote = marketDataService.getStockQuote(symbol);
-        name = quote.stockName();
+        if (name.isBlank() || name.length() > 150) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Stock name must contain between 1 and 150 characters");
+        }
 
-        db.update("""
+        int inserted = db.update("""
                 INSERT INTO watchlist (user_id, stock_symbol, stock_name, added_at)
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT (user_id, stock_symbol) DO NOTHING
                 """,
                 userId, symbol, name);
 
-        return Map.of("success", true, "message", symbol + " added to watchlist", "symbol", symbol);
+        boolean alreadyPresent = inserted == 0;
+        return Map.of("success", true, "alreadyPresent", alreadyPresent,
+                "message", alreadyPresent ? symbol + " is already in the watchlist" : symbol + " added to watchlist",
+                "symbol", symbol);
     }
 
     public Map<String, Object> removeFromWatchlist(long userId, String rawSymbol) {
