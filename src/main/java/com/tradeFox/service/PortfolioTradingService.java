@@ -24,6 +24,51 @@ public class PortfolioTradingService {
         this.marketDataService = marketDataService;
     }
 
+    private static final Map<String, String> CANONICAL_STOCK_NAMES = Map.ofEntries(
+            Map.entry("RELIANCE", "Reliance Industries Ltd."),
+            Map.entry("TCS", "Tata Consultancy Services Ltd."),
+            Map.entry("HDFCBANK", "HDFC Bank Ltd."),
+            Map.entry("INFY", "Infosys Ltd."),
+            Map.entry("ICICIBANK", "ICICI Bank Ltd."),
+            Map.entry("TATAMOTORS", "Tata Motors Ltd."),
+            Map.entry("SBIN", "State Bank of India"),
+            Map.entry("ITC", "ITC Ltd."),
+            Map.entry("BHARTIARTL", "Bharti Airtel Ltd."),
+            Map.entry("BAJFINANCE", "Bajaj Finance Ltd."),
+            Map.entry("MARUTI", "Maruti Suzuki India Ltd."),
+            Map.entry("LT", "Larsen & Toubro Ltd."),
+            Map.entry("TITAN", "Titan Company Ltd."),
+            Map.entry("WIPRO", "Wipro Ltd."),
+            Map.entry("KOTAKBANK", "Kotak Mahindra Bank Ltd."),
+            Map.entry("AXISBANK", "Axis Bank Ltd."),
+            Map.entry("TATASTEEL", "Tata Steel Ltd."),
+            Map.entry("HCLTECH", "HCL Technologies Ltd."),
+            Map.entry("HINDUNILVR", "Hindustan Unilever Ltd."),
+            Map.entry("SUNPHARMA", "Sun Pharmaceutical Industries"),
+            Map.entry("NTPC", "NTPC Ltd."),
+            Map.entry("POWERGRID", "Power Grid Corporation"),
+            Map.entry("ONGC", "Oil & Natural Gas Corporation"),
+            Map.entry("M&M", "Mahindra & Mahindra Ltd."),
+            Map.entry("HAL", "Hindustan Aeronautics Ltd."),
+            Map.entry("BEL", "Bharat Electronics Ltd."),
+            Map.entry("ZOMATO", "Zomato Ltd."),
+            Map.entry("JIOFIN", "Jio Financial Services Ltd."),
+            Map.entry("ADANIENT", "Adani Enterprises Ltd."),
+            Map.entry("ADANIPORTS", "Adani Ports & SEZ Ltd."),
+            Map.entry("COALINDIA", "Coal India Ltd."),
+            Map.entry("DRREDDY", "Dr. Reddy's Laboratories"),
+            Map.entry("CIPLA", "Cipla Ltd."),
+            Map.entry("IRCTC", "Indian Railway Catering & Tourism")
+    );
+
+    public static String resolveStockName(String symbol, String providedName) {
+        if (symbol != null) {
+            String canonical = CANONICAL_STOCK_NAMES.get(symbol.toUpperCase().trim());
+            if (canonical != null) return canonical;
+        }
+        return (providedName != null && !providedName.isBlank()) ? providedName.trim() : (symbol != null ? symbol : "");
+    }
+
     /**
      * Executes a BUY or SELL paper order and synchronizes users, orders, holdings, and transactions tables.
      */
@@ -41,7 +86,7 @@ public class PortfolioTradingService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Valid user ID is required");
         }
         String symbol = rawSymbol == null ? "" : rawSymbol.trim().toUpperCase(Locale.ROOT);
-        String name = rawName == null || rawName.isBlank() ? symbol : rawName.trim();
+        String name = resolveStockName(symbol, rawName);
         String orderType = rawOrderType == null ? "" : rawOrderType.trim().toUpperCase(Locale.ROOT);
         String executionType = (rawExecutionType == null || rawExecutionType.isBlank())
                 ? "MARKET" : rawExecutionType.trim().toUpperCase(Locale.ROOT);
@@ -367,16 +412,19 @@ public class PortfolioTradingService {
                 WHERE user_id = ? AND quantity > 0
                 ORDER BY updated_at DESC
                 """,
-                (rs, rowNum) -> new HoldingItem(
-                        rs.getLong("holding_id"),
-                        rs.getLong("user_id"),
-                        rs.getString("stock_symbol"),
-                        rs.getString("stock_name"),
-                        rs.getInt("quantity"),
-                        rs.getBigDecimal("average_purchase_price"),
-                        rs.getBigDecimal("invested_amount"),
-                        rs.getTimestamp("updated_at") != null ? rs.getTimestamp("updated_at").toInstant() : Instant.now()
-                ),
+                (rs, rowNum) -> {
+                    String sym = rs.getString("stock_symbol");
+                    return new HoldingItem(
+                            rs.getLong("holding_id"),
+                            rs.getLong("user_id"),
+                            sym,
+                            resolveStockName(sym, rs.getString("stock_name")),
+                            rs.getInt("quantity"),
+                            rs.getBigDecimal("average_purchase_price"),
+                            rs.getBigDecimal("invested_amount"),
+                            rs.getTimestamp("updated_at") != null ? rs.getTimestamp("updated_at").toInstant() : Instant.now()
+                    );
+                },
                 userId
         );
     }
@@ -391,17 +439,20 @@ public class PortfolioTradingService {
                 WHERE user_id = ?
                 ORDER BY created_at DESC
                 """,
-                (rs, rowNum) -> new OrderItem(
-                        rs.getLong("order_id"),
-                        rs.getLong("user_id"),
-                        rs.getString("stock_symbol"),
-                        rs.getString("stock_name"),
-                        rs.getString("order_type"),
-                        rs.getBigDecimal("order_price"),
-                        rs.getInt("quantity"),
-                        rs.getString("order_status"),
-                        rs.getTimestamp("created_at") != null ? rs.getTimestamp("created_at").toInstant() : Instant.now()
-                ),
+                (rs, rowNum) -> {
+                    String sym = rs.getString("stock_symbol");
+                    return new OrderItem(
+                            rs.getLong("order_id"),
+                            rs.getLong("user_id"),
+                            sym,
+                            resolveStockName(sym, rs.getString("stock_name")),
+                            rs.getString("order_type"),
+                            rs.getBigDecimal("order_price"),
+                            rs.getInt("quantity"),
+                            rs.getString("order_status"),
+                            rs.getTimestamp("created_at") != null ? rs.getTimestamp("created_at").toInstant() : Instant.now()
+                    );
+                },
                 userId
         );
     }
@@ -416,13 +467,16 @@ public class PortfolioTradingService {
                 WHERE user_id = ?
                 ORDER BY added_at DESC
                 """,
-                (rs, rowNum) -> new WatchlistItem(
-                        rs.getLong("watchlist_id"),
-                        rs.getLong("user_id"),
-                        rs.getString("stock_symbol"),
-                        rs.getString("stock_name"),
-                        rs.getTimestamp("added_at") != null ? rs.getTimestamp("added_at").toInstant() : Instant.now()
-                ),
+                (rs, rowNum) -> {
+                    String sym = rs.getString("stock_symbol");
+                    return new WatchlistItem(
+                            rs.getLong("watchlist_id"),
+                            rs.getLong("user_id"),
+                            sym,
+                            resolveStockName(sym, rs.getString("stock_name")),
+                            rs.getTimestamp("added_at") != null ? rs.getTimestamp("added_at").toInstant() : Instant.now()
+                    );
+                },
                 userId
         );
     }
@@ -474,7 +528,7 @@ public class PortfolioTradingService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Valid user ID is required");
         }
         String symbol = rawSymbol == null ? "" : rawSymbol.trim().toUpperCase(Locale.ROOT);
-        String name = rawName == null || rawName.isBlank() ? symbol : rawName.trim();
+        String name = resolveStockName(symbol, rawName);
 
         if (symbol.isBlank() || symbol.length() > 30) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Stock symbol must be between 1 and 30 characters");
