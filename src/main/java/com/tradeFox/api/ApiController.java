@@ -55,8 +55,9 @@ public class ApiController {
     }
 
     @GetMapping("/api/market/quotes")
-    public Map<String, Object> getMarketQuotes() {
-        return stockDetailService.getLiveMarketQuotes();
+    public Map<String, Object> getMarketQuotes(
+            @RequestParam(required = false) List<String> symbols) {
+        return stockDetailService.getLiveMarketQuotes(symbols);
     }
 
     @GetMapping("/api/market/indices")
@@ -120,6 +121,18 @@ public class ApiController {
     public UserDetails getUserDetails(@PathVariable long userId, HttpServletRequest httpRequest) {
         long authUserId = resolveAuthUserId(httpRequest);
         return userService.getUserDetails(authUserId);
+    }
+
+    @PostMapping("/api/users/wallet/funds")
+    public UserDetails addVirtualFunds(@RequestBody AddFundsRequest request, HttpServletRequest httpRequest) {
+        long authUserId = resolveAuthUserId(httpRequest);
+        return userService.addVirtualFunds(authUserId, request.amount());
+    }
+
+    @PostMapping("/api/users/wallet/reset")
+    public UserDetails resetWallet(HttpServletRequest httpRequest) {
+        long authUserId = resolveAuthUserId(httpRequest);
+        return userService.resetWallet(authUserId);
     }
 
     // --- Portfolio & Order Handshake Endpoints (Persisted in PostgreSQL) ---
@@ -197,6 +210,7 @@ public class ApiController {
 
     public record SignupRequest(String name, String email, String password) { }
     public record LoginRequest(String email, String password) { }
+    public record AddFundsRequest(BigDecimal amount) { }
     public record OrderRequest(
             Long userId,
             String stockSymbol,

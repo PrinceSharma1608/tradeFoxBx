@@ -6,6 +6,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.ConnectionCallback;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -14,6 +17,7 @@ import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
+import java.sql.PreparedStatement;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Instant;
@@ -29,16 +33,19 @@ public class AuthService {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private final JdbcTemplate db;
+    private final TransactionTemplate transactionTemplate;
     private final String jwtSecret;
     private final long tokenLifetimeMs;
 
     public AuthService(JdbcTemplate db,
+                       PlatformTransactionManager transactionManager,
                        @Value("${app.jwt.secret}") String jwtSecret,
                        @Value("${app.jwt.expiration-ms}") long tokenLifetimeMs) {
         if (jwtSecret.getBytes(StandardCharsets.UTF_8).length < 32 || tokenLifetimeMs <= 0) {
             throw new IllegalArgumentException("JWT secret must be at least 32 bytes and expiry must be positive");
         }
         this.db = db;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.jwtSecret = jwtSecret;
         this.tokenLifetimeMs = tokenLifetimeMs;
     }
@@ -51,16 +58,36 @@ public class AuthService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
                     "Provide a name, valid email, and password between 8 and 72 characters");
         }
-        try {
-            Map<String, Object> user = db.queryForMap("""
-                    INSERT INTO users (name, email, password_hash)
-                    VALUES (?, ?, ?)
-                    RETURNING user_id, name, email
-                    """, name, email, hashPassword(password));
-            return authResult(user);
-        } catch (DataIntegrityViolationException exception) {
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "Email is already registered");
-        }
+
+        return transactionTemplate.execute(status -> {
+            // Serialize signups for the normalized email so concurrent requests cannot both pass the existence check.
+            db.execute((ConnectionCallback<Void>) connection -> {
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "SELECT pg_advisory_xact_lock(hashtext(?))")) {
+                    statement.setString(1, email);
+                    statement.execute();
+                }
+                return null;
+            });
+
+            Boolean emailExists = db.queryForObject(
+                    "SELECT EXISTS (SELECT 1 FROM users WHERE LOWER(email) = ?)",
+                    Boolean.class, email);
+            if (Boolean.TRUE.equals(emailExists)) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "Email is already registered");
+            }
+
+            try {
+                Map<String, Object> user = db.queryForMap("""
+                        INSERT INTO users (name, email, password_hash)
+                        VALUES (?, ?, ?)
+                        RETURNING user_id, name, email
+                        """, name, email, hashPassword(password));
+                return authResult(user);
+            } catch (DataIntegrityViolationException exception) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "Email is already registered");
+            }
+        });
     }
 
     public Map<String, Object> login(String rawEmail, String password) {

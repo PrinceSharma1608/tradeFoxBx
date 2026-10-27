@@ -1,6 +1,7 @@
 package com.tradeFox.service;
 
 import org.springframework.http.HttpStatus;
+import org.springframework.beans.factory.InitializingBean;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -20,7 +21,7 @@ import java.util.Locale;
 import java.util.Map;
 
 @Service
-public class PortfolioTradingService {
+public class PortfolioTradingService implements InitializingBean {
     private static final BigDecimal MAX_WALLET_BALANCE = new BigDecimal("9999999999999.99");
     private static final BigDecimal MAX_ORDER_AMOUNT = new BigDecimal("9999999999.99");
 
@@ -33,6 +34,24 @@ public class PortfolioTradingService {
         this.db = db;
         this.marketDataService = marketDataService;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+    }
+
+    /** Creates the durable queue on startup and imports any pending orders created by older versions. */
+    @Override
+    public void afterPropertiesSet() {
+        db.execute("""
+                CREATE TABLE IF NOT EXISTS pending_orders (
+                    order_id INTEGER PRIMARY KEY REFERENCES orders(order_id) ON DELETE CASCADE,
+                    execution_type VARCHAR(6) NOT NULL CHECK (execution_type IN ('MARKET', 'LIMIT')),
+                    queued_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """);
+        db.update("""
+                INSERT INTO pending_orders (order_id, execution_type)
+                SELECT order_id, 'LIMIT' FROM orders WHERE order_status = 'PENDING'
+                ON CONFLICT (order_id) DO NOTHING
+                """);
+        db.execute("CREATE INDEX IF NOT EXISTS pending_orders_queued_at_idx ON pending_orders (queued_at, order_id)");
     }
 
     private static final Map<String, String> CANONICAL_STOCK_NAMES = Map.ofEntries(
@@ -261,6 +280,9 @@ public class PortfolioTradingService {
                     "A positive reference price is required while the market is closed");
         }
         String name = quote != null ? quote.stockName() : resolveStockName(symbol, rawName);
+        if (name.length() > 150) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Stock name cannot exceed 150 characters");
+        }
         BigDecimal livePrice = quote == null ? null : quote.price().setScale(2, RoundingMode.HALF_UP);
         BigDecimal price = "LIMIT".equals(executionType) ? limitPrice
                 : (marketOpen ? livePrice : referencePrice.setScale(2, RoundingMode.HALF_UP));

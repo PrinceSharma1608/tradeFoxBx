@@ -32,15 +32,17 @@ public class StockDetailService {
 
     /** Dashboard data comes from the same provider snapshot as the other market endpoints. */
     public Map<String, Object> getLiveMarketQuotes() {
+        return getLiveMarketQuotes(List.of());
+    }
+
+    public Map<String, Object> getLiveMarketQuotes(List<String> requestedSymbols) {
         IndstocksMarketDataService.MarketStatus status = marketDataService.getMarketStatus();
         Map<String, Object> quotesBySymbol = new LinkedHashMap<>();
         List<IndstocksMarketDataService.StockQuote> quotes = List.of();
-        if (status.tokenReady() || !marketDataService.isMarketOpen()) {
-            try {
-                quotes = marketDataService.getConfiguredStockQuotes();
-            } catch (ResponseStatusException ignored) {
-                // After hours, show an empty snapshot if this process has no cached market data yet.
-            }
+        if (requestedSymbols != null && !requestedSymbols.isEmpty()) {
+            quotes = marketDataService.getStockQuotes(requestedSymbols);
+        } else if (status.tokenReady()) {
+            quotes = marketDataService.getConfiguredStockQuotes();
         }
         for (IndstocksMarketDataService.StockQuote quote : quotes) {
             Map<String, Object> data = new LinkedHashMap<>();
@@ -57,7 +59,15 @@ public class StockDetailService {
             data.put("low", quote.dayLow());
             data.put("prev_close", quote.previousClose());
             data.put("volume", quote.volume());
+            data.put("updated_at", quote.updatedAt());
             quotesBySymbol.put(quote.stockSymbol(), data);
+            if (requestedSymbols != null) {
+                for (String requestedSymbol : requestedSymbols) {
+                    if (marketDataService.canonicalStockSymbol(requestedSymbol).equals(quote.stockSymbol())) {
+                        quotesBySymbol.put(requestedSymbol.trim().toUpperCase(Locale.ROOT), data);
+                    }
+                }
+            }
         }
         Map<String, Object> indices = new LinkedHashMap<>();
         for (IndstocksMarketDataService.MarketIndexQuote quote : marketDataService.getMarketIndices()) {
@@ -71,7 +81,12 @@ public class StockDetailService {
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("tokenReady", status.tokenReady());
         response.put("tokenExpiresAt", status.tokenExpiresAt());
-        response.put("updatedAt", status.updatedAt());
+        response.put("marketOpen", marketDataService.isMarketOpen());
+        response.put("updatedAt", quotes.stream()
+                .map(IndstocksMarketDataService.StockQuote::updatedAt)
+                .filter(java.util.Objects::nonNull)
+                .max(java.time.Instant::compareTo)
+                .orElse(status.updatedAt()));
         response.put("data", quotesBySymbol);
         response.put("indices", indices);
         response.put("lastError", status.lastError());

@@ -10,11 +10,19 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import javax.crypto.Mac;
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.util.ArrayDeque;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -38,6 +46,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.security.SecureRandom;
 import java.util.stream.Collectors;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
@@ -51,8 +60,6 @@ public class IndstocksMarketDataService {
     private static final LocalTime MARKET_CLOSE = LocalTime.of(15, 30);
     private static final Logger log = LoggerFactory.getLogger(IndstocksMarketDataService.class);
     private static final Duration ACCESS_TOKEN_LIFETIME = Duration.ofHours(24);
-    private static final Duration TOKEN_REFRESH_BUFFER = Duration.ofMinutes(5);
-    private static final Duration TOKEN_RETRY_DELAY = Duration.ofMinutes(5);
     private static final Map<String, Duration> HISTORICAL_MAX_RANGES = Map.ofEntries(
             Map.entry("1minute", Duration.ofDays(7)),
             Map.entry("2minute", Duration.ofDays(7)),
@@ -92,9 +99,12 @@ public class IndstocksMarketDataService {
     private final String clientId;
     private final String mpin;
     private final String totpSecret;
+    private final String tokenCacheSecret;
+    private final Path tokenCacheFile;
     private final String scripCodes;
-    private final List<String> websocketInstruments;
-    private final Map<String, String> websocketInstrumentNames;
+    private final boolean configuredWebsocketInstruments;
+    private volatile List<String> websocketInstruments;
+    private volatile Map<String, String> websocketInstrumentNames;
     private final Set<LocalDate> marketHolidays;
     private final Map<String, Object> indexQuotes = new ConcurrentHashMap<>();
     private final Map<String, Deque<IndexPriceSample>> indexHistory = new ConcurrentHashMap<>();
@@ -112,7 +122,10 @@ public class IndstocksMarketDataService {
     private volatile String priceSocketToken;
     private volatile String connectingSocketToken;
     private volatile Instant nextTokenAttempt = Instant.EPOCH;
+    private volatile Instant nextIndexSubscriptionAttempt = Instant.EPOCH;
+    private volatile boolean indexSubscriptionsInitialized;
     private volatile boolean reportedMissingCredentials;
+    private volatile boolean reportedTokenCooldown;
     private volatile MarketSnapshot snapshot = new MarketSnapshot(null, Map.of(), "No market data yet");
 
     public IndstocksMarketDataService(
@@ -122,15 +135,20 @@ public class IndstocksMarketDataService {
             @Value("${indstocks.totp-secret:}") String totpSecret,
             @Value("${indstocks.scrip-codes:}") String scripCodes,
             @Value("${indstocks.websocket-instruments:}") String websocketInstruments,
-            @Value("${indstocks.market-holidays:}") String marketHolidays) {
+            @Value("${indstocks.market-holidays:}") String marketHolidays,
+            @Value("${app.jwt.secret}") String tokenCacheSecret) {
         this.apiBaseUrl = apiBaseUrl;
         this.objectMapper = new ObjectMapper();
         this.clientId = clientId.trim();
         this.mpin = mpin.trim();
         this.totpSecret = totpSecret.trim();
+        this.tokenCacheSecret = tokenCacheSecret;
+        this.tokenCacheFile = Path.of(System.getProperty("user.home"), ".tradefox", "indstocks-token.bin");
         this.scripCodes = normalizeScripCodes(scripCodes);
+        this.configuredWebsocketInstruments = websocketInstruments != null && !websocketInstruments.isBlank();
         this.websocketInstruments = parseWebsocketInstruments(websocketInstruments);
         this.websocketInstrumentNames = createWebsocketInstrumentNames(this.websocketInstruments);
+        this.indexSubscriptionsInitialized = this.configuredWebsocketInstruments;
         this.marketHolidays = parseMarketHolidays(marketHolidays);
     }
 
@@ -144,10 +162,50 @@ public class IndstocksMarketDataService {
                 && time.isBefore(MARKET_CLOSE);
     }
 
-    /** Creates a token at startup, then refreshes shortly before the 24-hour expiry. */
+    /** Reuses the encrypted token cache and refreshes shortly before the 24-hour expiry. */
     @Scheduled(fixedDelayString = "${indstocks.token-check-ms:60000}")
     public synchronized void refreshTokenIfNeeded() {
-        if (!isMarketOpen()) return;
+        try {
+            Files.createDirectories(tokenCacheFile.getParent());
+            Path lockFile = tokenCacheFile.resolveSibling(tokenCacheFile.getFileName() + ".lock");
+            try (FileChannel channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                 FileLock ignored = channel.lock()) {
+                refreshTokenUnderCacheLock();
+            }
+        } catch (Exception exception) {
+            log.warn("Could not safely check the local INDstocks token cache ({}).", exception.getClass().getSimpleName());
+        }
+    }
+
+    private void refreshTokenUnderCacheLock() throws Exception {
+        Instant now = Instant.now();
+        TokenCache cache = readTokenCache();
+        if (cache != null) {
+            accessToken = cache.token();
+            tokenExpiresAt = cache.expiresAt();
+            lastTokenGeneratedAt = cache.generatedAt();
+            nextTokenAttempt = cache.lastAttemptAt() == null
+                    ? Instant.EPOCH : cache.lastAttemptAt().atZone(MARKET_ZONE).toLocalDate()
+                            .plusDays(1).atStartOfDay(MARKET_ZONE).toInstant();
+            if (accessToken != null && tokenExpiresAt != null
+                    && now.isBefore(tokenExpiresAt)) {
+                if (websocketInstruments.isEmpty()) refreshIndexSubscriptions(accessToken);
+                connectPriceSocketIfNeeded(accessToken);
+                return;
+            }
+            boolean attemptedToday = cache.lastAttemptAt() != null
+                    && cache.lastAttemptAt().atZone(MARKET_ZONE).toLocalDate()
+                            .equals(now.atZone(MARKET_ZONE).toLocalDate());
+            if (attemptedToday) {
+                if (!reportedTokenCooldown) {
+                    log.info("INDstocks token generation already ran today; next attempt is eligible after {} IST.",
+                            nextTokenAttempt);
+                    reportedTokenCooldown = true;
+                }
+                return;
+            }
+        }
+
         if (clientId.isBlank() || mpin.isBlank() || totpSecret.isBlank()) {
             if (!reportedMissingCredentials) {
                 log.info("INDstocks token generation is waiting for INDSTOCKS_CLIENT_ID, INDSTOCKS_MPIN and INDSTOCKS_TOTP_SECRET.");
@@ -156,17 +214,10 @@ public class IndstocksMarketDataService {
             return;
         }
 
-        Instant now = Instant.now();
-        if (accessToken != null && tokenExpiresAt != null
-                && now.isBefore(tokenExpiresAt.minus(TOKEN_REFRESH_BUFFER))) return;
-        if (now.isBefore(nextTokenAttempt)) return;
-        if (lastTokenGeneratedAt != null
-                && now.isBefore(lastTokenGeneratedAt.plusSeconds(60))) {
-            nextTokenAttempt = lastTokenGeneratedAt.plusSeconds(60);
-            return;
-        }
-
-        nextTokenAttempt = now.plus(TOKEN_RETRY_DELAY);
+        Instant attemptedAt = Instant.now();
+        writeTokenCache(new TokenCache(accessToken, tokenExpiresAt, lastTokenGeneratedAt, attemptedAt));
+        nextTokenAttempt = attemptedAt.atZone(MARKET_ZONE).toLocalDate().plusDays(1)
+                .atStartOfDay(MARKET_ZONE).toInstant();
         try {
             String requestBody = objectMapper.writeValueAsString(
                     Map.of("mpin", mpin, "totp", currentTotp(totpSecret)));
@@ -178,7 +229,9 @@ public class IndstocksMarketDataService {
                     .build();
             HttpResponse<String> httpResponse = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             if (httpResponse.statusCode() < 200 || httpResponse.statusCode() >= 300) {
-                throw new IllegalStateException("INDstocks token request failed");
+                log.warn("INDstocks token endpoint returned HTTP {}.", httpResponse.statusCode());
+                throw new IllegalStateException("INDstocks token request failed with HTTP "
+                        + httpResponse.statusCode());
             }
             JsonNode response = objectMapper.readTree(httpResponse.body());
 
@@ -195,22 +248,71 @@ public class IndstocksMarketDataService {
             lastTokenGeneratedAt = Instant.now();
             tokenExpiresAt = lastTokenGeneratedAt.plus(ACCESS_TOKEN_LIFETIME);
             nextTokenAttempt = Instant.EPOCH;
+            reportedTokenCooldown = false;
+            writeTokenCache(new TokenCache(accessToken, tokenExpiresAt, lastTokenGeneratedAt, attemptedAt));
+            refreshIndexSubscriptions(token);
             connectPriceSocketIfNeeded(token);
             log.info("INDstocks access token generated; it will refresh before expiry.");
             refreshMarketData();
         } catch (Exception exception) {
             // Do not log response bodies or request data; they can contain account details.
-            log.warn("INDstocks token generation failed. Check the Client ID, MPIN, TOTP secret, and server clock.");
+            log.warn("INDstocks token generation failed ({}). No further attempt will be made today to protect the TOTP account.",
+                    exception.getClass().getSimpleName());
         }
     }
 
-    /** Fetches one quote snapshot per backend instance, not once per frontend visitor. */
+    private TokenCache readTokenCache() throws Exception {
+        if (!Files.exists(tokenCacheFile)) return null;
+        byte[] stored = Files.readAllBytes(tokenCacheFile);
+        if (stored.length <= 12) throw new IOException("Invalid token cache");
+        byte[] nonce = java.util.Arrays.copyOfRange(stored, 0, 12);
+        byte[] encrypted = java.util.Arrays.copyOfRange(stored, 12, stored.length);
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, tokenCacheKey(), new GCMParameterSpec(128, nonce));
+        JsonNode json = objectMapper.readTree(cipher.doFinal(encrypted));
+        String token = json.path("token").isTextual() ? json.path("token").asText() : null;
+        return new TokenCache(token, cacheInstant(json, "expiresAt"), cacheInstant(json, "generatedAt"),
+                cacheInstant(json, "lastAttemptAt"));
+    }
+
+    private void writeTokenCache(TokenCache cache) throws Exception {
+        Map<String, Object> json = new LinkedHashMap<>();
+        if (cache.token() != null) json.put("token", cache.token());
+        if (cache.expiresAt() != null) json.put("expiresAt", cache.expiresAt().toEpochMilli());
+        if (cache.generatedAt() != null) json.put("generatedAt", cache.generatedAt().toEpochMilli());
+        if (cache.lastAttemptAt() != null) json.put("lastAttemptAt", cache.lastAttemptAt().toEpochMilli());
+        byte[] nonce = new byte[12];
+        new SecureRandom().nextBytes(nonce);
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, tokenCacheKey(), new GCMParameterSpec(128, nonce));
+        byte[] encrypted = cipher.doFinal(objectMapper.writeValueAsBytes(json));
+        Path tempFile = tokenCacheFile.resolveSibling(tokenCacheFile.getFileName() + ".tmp");
+        ByteBuffer contents = ByteBuffer.allocate(nonce.length + encrypted.length).put(nonce).put(encrypted);
+        Files.write(tempFile, contents.array(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE);
+        try {
+            Files.move(tempFile, tokenCacheFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (java.nio.file.AtomicMoveNotSupportedException exception) {
+            Files.move(tempFile, tokenCacheFile, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private SecretKeySpec tokenCacheKey() throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(tokenCacheSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        return new SecretKeySpec(mac.doFinal("TradeFox INDstocks token cache v1".getBytes(StandardCharsets.UTF_8)), "AES");
+    }
+
+    private Instant cacheInstant(JsonNode json, String field) {
+        JsonNode value = json.path(field);
+        return value.canConvertToLong() ? Instant.ofEpochMilli(value.asLong()) : null;
+    }
+
+    private record TokenCache(String token, Instant expiresAt, Instant generatedAt, Instant lastAttemptAt) { }
+
+    /** Reuses each provider quote for up to one minute across dashboard requests. */
     @Scheduled(fixedDelayString = "${indstocks.market-refresh-ms:60000}", initialDelay = 5000)
     public void refreshMarketData() {
-        if (!isMarketOpen()) {
-            disconnectPriceSocket();
-            return;
-        }
         String token = accessToken;
         if (token == null || token.isBlank()) return;
         connectPriceSocketIfNeeded(token);
@@ -301,10 +403,19 @@ public class IndstocksMarketDataService {
         if (name == null || name.isBlank()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Index name is required");
         }
-        String key = normalizeName(name);
-        if (key.contains("NIFTY")) return "NIFTY 50";
-        if (key.contains("SENSEX")) return "SENSEX";
+        String displayName = canonicalIndexDisplayName(name);
+        if (displayName != null) return displayName;
         throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Index not found");
+    }
+
+    private String canonicalIndexDisplayName(String providerName) {
+        String key = normalizeName(providerName);
+        if (key.contains("SENSEX")) return "SENSEX";
+        if (key.contains("NIFTY") && key.contains("IT")) return "NIFTY IT";
+        if (key.contains("BANK") && key.contains("NIFTY")) return "BANK NIFTY";
+        if (key.contains("VIX")) return "INDIA VIX";
+        if (key.equals("NIFTY") || key.equals("NIFTY50") || key.contains("NIFTY 50")) return "NIFTY 50";
+        return null;
     }
 
     private void validateIndexHistoryRange(long startTime, long endTime) {
@@ -335,21 +446,18 @@ public class IndstocksMarketDataService {
         if (stockNames == null || stockNames.isEmpty()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "At least one stock symbol is required");
         }
-        if (stockNames.size() > 100) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "A maximum of 100 stocks can be requested");
+        if (stockNames.size() > 1000) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "A maximum of 1000 stocks can be requested");
         }
 
-        boolean marketOpen = isMarketOpen();
-        String token = marketOpen ? requireAccessToken() : accessToken;
+        String token = requireAccessToken();
         Map<String, Instrument> instrumentsByCode = new LinkedHashMap<>();
         for (String stockName : stockNames) {
             if (stockName == null || stockName.isBlank()) {
                 throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Stock symbols cannot be blank");
             }
             try {
-                Instrument instrument = marketOpen
-                        ? findInstrument(stockName, token)
-                        : findCachedInstrument(stockName);
+                Instrument instrument = findInstrument(stockName, token);
                 if (instrument != null) {
                     instrumentsByCode.putIfAbsent(instrument.scripCode(), instrument);
                 }
@@ -364,13 +472,9 @@ public class IndstocksMarketDataService {
             List<Instrument> instrumentsToFetch = new ArrayList<>();
             for (Instrument instrument : instrumentsByCode.values()) {
                 CachedStockQuote cached = stockQuoteCache.get(instrument.scripCode());
-                if (cached != null && (!marketOpen || now.isBefore(cached.fetchedAt().plusSeconds(60)))) {
+                if (cached != null && now.isBefore(cached.fetchedAt().plusSeconds(60))) {
                     quotesByCode.put(instrument.scripCode(), cached.quote());
                 } else {
-                    if (!marketOpen) {
-                        throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
-                                "Market is closed and no recent quote is available");
-                    }
                     instrumentsToFetch.add(instrument);
                 }
             }
@@ -391,7 +495,7 @@ public class IndstocksMarketDataService {
     public List<StockQuote> getConfiguredStockQuotes() {
         if (scripCodes.isBlank()) return List.of();
         List<String> configuredCodes = List.of(scripCodes.split(","));
-        List<String> symbols = getEquityInstrumentAliases(isMarketOpen() ? requireAccessToken() : accessToken).values().stream()
+        List<String> symbols = getEquityInstrumentAliases(requireAccessToken()).values().stream()
                 .distinct()
                 .filter(instrument -> configuredCodes.contains(instrument.scripCode()))
                 .map(Instrument::tradingSymbol)
@@ -413,7 +517,7 @@ public class IndstocksMarketDataService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Limit must be between 1 and 50");
         }
 
-        String token = isMarketOpen() ? requireAccessToken() : accessToken;
+        String token = requireAccessToken();
         String search = normalizeName(query);
         return getEquityInstrumentAliases(token).values().stream()
                 .distinct()
@@ -481,7 +585,7 @@ public class IndstocksMarketDataService {
     }
 
     private Instrument findInstrument(String stockName, String token) {
-        String key = normalizeName(stockName);
+        String key = canonicalStockSymbol(stockName);
         if (key.isBlank()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Stock name is required");
         }
@@ -506,6 +610,11 @@ public class IndstocksMarketDataService {
         return instrument;
     }
 
+    public String canonicalStockSymbol(String stockName) {
+        String key = normalizeName(stockName);
+        return key.equals("ZOMATO") ? "ETERNAL" : key;
+    }
+
     private boolean hasExactAlias(Instrument instrument, String key) {
         return normalizeName(instrument.tradingSymbol()).equals(key)
                 || normalizeName(instrument.customSymbol()).equals(key)
@@ -519,7 +628,6 @@ public class IndstocksMarketDataService {
             synchronized (instrumentMasterLock) {
                 fetchedAt = instrumentMasterFetchedAt;
                 if (fetchedAt == null || Instant.now().isAfter(fetchedAt.plus(Duration.ofHours(24)))) {
-                    if (!isMarketOpen() && !instrumentAliases.isEmpty()) return instrumentAliases;
                     String csv = getProviderResource("/market/instruments?source=equity", token);
                     aliases = parseInstrumentMaster(csv);
                     instrumentAliases = aliases;
@@ -620,9 +728,14 @@ public class IndstocksMarketDataService {
     }
 
     private String indexSymbol(String name) {
-        if (name.toUpperCase(Locale.ROOT).contains("SENSEX")) return "SENSEX";
-        if (name.toUpperCase(Locale.ROOT).contains("NIFTY")) return "NIFTY";
-        return name;
+        return switch (normalizeName(name)) {
+            case "NIFTY 50" -> "NIFTY";
+            case "SENSEX" -> "SENSEX";
+            case "BANK NIFTY" -> "BANKNIFTY";
+            case "NIFTY IT" -> "NIFTYIT";
+            case "INDIA VIX" -> "INDIAVIX";
+            default -> name;
+        };
     }
 
     private String exchangeForIndex(String name) {
@@ -631,6 +744,20 @@ public class IndstocksMarketDataService {
 
     private Map<String, StockQuote> fetchStockQuotes(List<Instrument> instruments, String token) {
         if (instruments.isEmpty()) return Map.of();
+        try {
+            return fetchStockQuoteBatch(instruments, token);
+        } catch (ResponseStatusException exception) {
+            if (exception.getStatusCode() != HttpStatus.BAD_REQUEST) throw exception;
+            if (instruments.size() == 1) return Map.of();
+
+            int middle = instruments.size() / 2;
+            Map<String, StockQuote> quotes = new HashMap<>(fetchStockQuotes(instruments.subList(0, middle), token));
+            quotes.putAll(fetchStockQuotes(instruments.subList(middle, instruments.size()), token));
+            return Map.copyOf(quotes);
+        }
+    }
+
+    private Map<String, StockQuote> fetchStockQuoteBatch(List<Instrument> instruments, String token) {
         String codes = instruments.stream().map(Instrument::scripCode)
                 .reduce((first, second) -> first + "," + second).orElse("");
         String encodedCodes = URLEncoder.encode(codes, StandardCharsets.UTF_8);
@@ -645,10 +772,7 @@ public class IndstocksMarketDataService {
             for (Instrument instrument : instruments) {
                 JsonNode data = quoteData.path(instrument.scripCode());
                 BigDecimal price = decimalValue(data.get("live_price"));
-                if (data.isMissingNode() || price == null) {
-                    throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
-                            "Market data provider returned an invalid quote");
-                }
+                if (data.isMissingNode() || price == null || price.signum() <= 0) continue;
                 BigDecimal dayChange = decimalValue(data.get("day_change"));
                 BigDecimal dayChangePercentage = decimalValue(data.get("day_change_percentage"));
                 Map<String, Object> marketDepth = data.path("market_depth").isObject()
@@ -789,7 +913,6 @@ public class IndstocksMarketDataService {
     }
 
     private String getProviderResource(String path, String token) {
-        requireMarketOpenForProviderCall();
         HttpRequest request = HttpRequest.newBuilder(URI.create(apiBaseUrl + path))
                 .timeout(Duration.ofSeconds(15))
                 .header("Authorization", token)
@@ -804,6 +927,14 @@ public class IndstocksMarketDataService {
                 }
                 throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
                         "Market data access token was rejected");
+            }
+            if (response.statusCode() == 429) {
+                throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                        "Market data provider rate limit reached; retry shortly");
+            }
+            if (response.statusCode() == 400 && path.startsWith("/market/quotes/full?")) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "Market data provider rejected one or more quote instruments");
             }
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
                 throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,
@@ -821,18 +952,63 @@ public class IndstocksMarketDataService {
     }
 
     private List<String> parseWebsocketInstruments(String configured) {
-        if (configured == null || configured.isBlank()) {
-            return List.of("NIDX:26000", "BIDX:1");
-        }
+        if (configured == null || configured.isBlank()) return List.of();
         List<String> instruments = new ArrayList<>();
         for (String value : configured.split(",")) {
             String instrument = value.trim();
             if (!instrument.matches("(NIDX|BIDX):[A-Za-z0-9]+")) {
                 throw new IllegalArgumentException("INDSTOCKS_WEBSOCKET_INSTRUMENTS must use NIDX:<id> or BIDX:<id> values");
             }
-            instruments.add(instrument);
+            if (!instruments.contains(instrument)) instruments.add(instrument);
         }
         return List.copyOf(instruments);
+    }
+
+    /** Resolves index feed tokens from INDstocks' index master instead of treating doc examples as real IDs. */
+    private void refreshIndexSubscriptions(String token) {
+        Instant now = Instant.now();
+        if (configuredWebsocketInstruments || indexSubscriptionsInitialized
+                || now.isBefore(nextIndexSubscriptionAttempt)) return;
+        nextIndexSubscriptionAttempt = now.plus(Duration.ofMinutes(5));
+        try {
+            List<List<String>> rows = parseCsv(getProviderResource("/market/instruments?source=index", token));
+            Map<String, String> instrumentByName = new HashMap<>();
+            for (int rowIndex = 1; rowIndex < rows.size(); rowIndex++) {
+                List<String> row = rows.get(rowIndex);
+                String exchange = csvValue(row, 0).toUpperCase(Locale.ROOT);
+                String indexName = canonicalIndexDisplayName(csvValue(row, 1));
+                String securityId = csvValue(row, 2);
+                if (indexName == null || securityId.isBlank()) continue;
+                String prefix = exchange.equals("NSE") ? "NIDX" : exchange.equals("BSE") ? "BIDX" : null;
+                if (prefix != null) instrumentByName.putIfAbsent(indexName, prefix + ":" + securityId);
+            }
+
+            List<String> displayNames = List.of("NIFTY 50", "SENSEX", "BANK NIFTY", "NIFTY IT", "INDIA VIX");
+            Map<String, String> namesByInstrument = new LinkedHashMap<>();
+            for (String displayName : displayNames) {
+                String instrument = instrumentByName.get(displayName);
+                if (instrument != null) namesByInstrument.put(instrument, displayName);
+            }
+            indexSubscriptionsInitialized = true;
+            if (namesByInstrument.isEmpty()) {
+                log.warn("INDstocks index master contained no supported dashboard indices.");
+                return;
+            }
+
+            List<String> resolvedInstruments = List.copyOf(namesByInstrument.keySet());
+            boolean changed = !resolvedInstruments.equals(websocketInstruments);
+            websocketInstruments = resolvedInstruments;
+            websocketInstrumentNames = Map.copyOf(namesByInstrument);
+            if (changed) {
+                indexQuotes.clear();
+                indexHistory.clear();
+                priceSocketToken = null;
+            }
+            log.info("Resolved {} dashboard index feeds from the INDstocks instrument master.", resolvedInstruments.size());
+        } catch (Exception exception) {
+            log.warn("Could not resolve dashboard index feeds from the INDstocks instrument master ({}: {}).",
+                    exception.getClass().getSimpleName(), exception.getMessage());
+        }
     }
 
     private Map<String, String> createWebsocketInstrumentNames(List<String> instruments) {
@@ -865,7 +1041,6 @@ public class IndstocksMarketDataService {
     }
 
     private synchronized void connectPriceSocketIfNeeded(String token) {
-        if (!isMarketOpen()) return;
         if (websocketInstruments.isEmpty()) return;
         if (token.equals(priceSocketToken) && priceSocket != null
                 && !priceSocket.isInputClosed() && !priceSocket.isOutputClosed()) return;
@@ -903,37 +1078,6 @@ public class IndstocksMarketDataService {
             connectingSocketToken = null;
             log.warn("Could not start the INDstocks index price stream.");
         }
-    }
-
-    private synchronized void disconnectPriceSocket() {
-        WebSocket socket = priceSocket;
-        priceSocket = null;
-        priceSocketToken = null;
-        connectingSocketToken = null;
-        if (socket != null && !socket.isOutputClosed()) {
-            try {
-                socket.sendClose(WebSocket.NORMAL_CLOSURE, "Market closed");
-            } catch (Exception ignored) {
-                // A socket may close between checking its state and sending the close frame.
-            }
-        }
-    }
-
-    private void requireMarketOpenForProviderCall() {
-        if (!isMarketOpen()) {
-            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
-                    "Market data is available from 09:15 to 15:30 IST on configured trading days");
-        }
-    }
-
-    private Instrument findCachedInstrument(String stockName) {
-        String key = normalizeName(stockName);
-        Instrument instrument = instrumentAliases.get(key);
-        if (instrument == null) {
-            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
-                    "Market is closed and this stock is not in the cached instrument list");
-        }
-        return instrument;
     }
 
     private Set<LocalDate> parseMarketHolidays(String configured) {
@@ -1039,14 +1183,43 @@ public class IndstocksMarketDataService {
         if (separator >= 0) instrumentId = instrumentId.substring(separator + 1);
         for (String configuredInstrument : websocketInstruments) {
             if (configuredInstrument.substring(configuredInstrument.indexOf(':') + 1).equals(instrumentId)) {
+                Map<String, Object> previous = new HashMap<>();
+                Object priorQuote = indexQuotes.get(configuredInstrument);
+                if (priorQuote instanceof Map<?, ?> map) {
+                    map.forEach((key, value) -> {
+                        if (key instanceof String field) previous.put(field, value);
+                    });
+                }
                 Map<String, Object> quote = new HashMap<>();
                 quote.put("ltp", objectMapper.convertValue(ltpNode, Object.class));
                 quote.put("timestamp", message.path("timestamp").asLong());
                 copyOptionalNumber(data, quote, "day_change");
                 copyOptionalNumber(data, quote, "day_change_percentage");
+                copyOptionalNumber(data, quote, "prev_close");
+                BigDecimal price = decimalValueFromObject(quote.get("ltp"));
+                BigDecimal previousClose = decimalValueFromObject(quote.get("prev_close"));
+                if (previousClose == null) {
+                    previousClose = decimalValueFromObject(previous.get("prev_close"));
+                }
+                if (previousClose == null) {
+                    BigDecimal previousPrice = decimalValueFromObject(previous.get("ltp"));
+                    BigDecimal previousChange = decimalValueFromObject(previous.get("day_change"));
+                    if (previousPrice != null && previousChange != null) {
+                        previousClose = previousPrice.subtract(previousChange);
+                    }
+                }
+                if (previousClose != null) quote.put("prev_close", previousClose);
+                if (!data.hasNonNull("day_change") && price != null && previousClose != null) {
+                    quote.put("day_change", price.subtract(previousClose));
+                }
+                if (!data.hasNonNull("day_change_percentage") && price != null && previousClose != null
+                        && previousClose.signum() != 0) {
+                    BigDecimal change = price.subtract(previousClose);
+                    quote.put("day_change_percentage", change.multiply(BigDecimal.valueOf(100))
+                            .divide(previousClose, 4, java.math.RoundingMode.HALF_UP));
+                }
                 indexQuotes.put(configuredInstrument, Map.copyOf(quote));
                 String displayName = websocketInstrumentNames.getOrDefault(configuredInstrument, configuredInstrument);
-                BigDecimal price = decimalValueFromObject(quote.get("ltp"));
                 if (price != null) {
                     recordIndexSample(displayName, websocketTimestamp(quote).toEpochMilli(), price);
                 }
